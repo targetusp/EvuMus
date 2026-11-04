@@ -55,6 +55,14 @@
   function coverLetter(t) { return (t || '?').charAt(0).toUpperCase(); }
   function toast(msg) { var el = $('#toast'); if(!el) return; el.textContent = msg; el.hidden = false; clearTimeout(el._t); el._t = setTimeout(function () { el.hidden = true; }, 2200); }
 
+  // Парсим строку "3:45" в секунды (225)
+  function parseDuration(durStr) {
+    if (!durStr) return 0;
+    var parts = durStr.split(':');
+    if (parts.length === 2) return parseInt(parts[0], 10) * 60 + parseInt(parts[1], 10);
+    return parseInt(durStr, 10) || 0;
+  }
+
   // ===== API Запросы =====
   function getAuthHeader() { return (TG && TG.initData) ? { 'Authorization': TG.initData } : {}; }
 
@@ -154,7 +162,6 @@
     
     setTimeout(setupAnimations, 50);
     if (name === 'mymusic') {
-      // Запускаем фоновое восстановление при заходе на страницу
       restoreMissingPreviews();
     }
   }
@@ -189,8 +196,6 @@
 
   async function restorePreview(tr, silent) {
     if (tr.preview) return true;
-    
-    // Если уже восстанавливается - ждем
     if (restorePromises[tr.id]) return await restorePromises[tr.id];
 
     restorePromises[tr.id] = (async function() {
@@ -212,15 +217,6 @@
               });
               
               trackRegistry[oldId] = tr;
-              
-              // Обновляем кнопку, чтобы она стала активной
-              var row = document.querySelector('.track[data-id="' + oldId + '"]');
-              if (row) {
-                  var btn = row.querySelector('.js-play');
-                  if (btn) {
-                      // Визуально можно ничего не делать, просто ссылка теперь есть
-                  }
-              }
               return true;
           }
         } catch (e) {}
@@ -234,15 +230,12 @@
   async function restoreMissingPreviews() {
     if (isRestoringAll) return;
     isRestoringAll = true;
-    
     var tracks = (mymusicTab === 'all') ? library : favs;
     var missing = tracks.filter(function(t) { return !t.preview; });
-    
     for (var i = 0; i < missing.length; i++) {
-        await restorePreview(missing[i], true); // true = silent (без тостов)
-        await new Promise(r => setTimeout(r, 500)); // пауза 0.5 сек, чтобы не спамить сервер
+        await restorePreview(missing[i], true);
+        await new Promise(r => setTimeout(r, 500));
     }
-    
     isRestoringAll = false;
   }
 
@@ -352,8 +345,6 @@
     var el = $('#myEmpty'); if(el) el.hidden = tracks.length > 0; 
     var c = $('#myCount'); if(c) c.textContent = 'Треков: ' + tracks.length; 
     renderList($('#myList'), tracks); 
-    
-    // Запускаем фоновое восстановление
     restoreMissingPreviews();
   }
 
@@ -464,7 +455,7 @@
   async function triggerPlay(row) {
     if (!row) return; var id = row.getAttribute('data-id'); var tr = findTrack(id); if (!tr) return;
     if (!tr.preview) {
-        var restored = await restorePreview(tr, false); // false = показываем тост
+        var restored = await restorePreview(tr, false);
         if (!restored) return;
     }
     queueIds = []; row.parentElement.querySelectorAll('.track').forEach(function (r) { queueIds.push(r.getAttribute('data-id')); }); playPreview(tr);
@@ -586,7 +577,18 @@
     var playPromise = previewAudio.play(); if (playPromise && playPromise.catch) playPromise.catch(function () {});
     showPlayer(t); setPlayingUI(true);
     
-    previewAudio.ontimeupdate = function () { if (previewAudio && !seekDrag) { var dur = (previewAudio.duration && isFinite(previewAudio.duration) && previewAudio.duration > 0) ? previewAudio.duration : 30; var p = $('#playerProgress'); if(p) p.style.width = Math.min(100, (previewAudio.currentTime / dur * 100)) + '%'; } };
+    // ИСПРАВЛЕНО: Берем длительность из метаданных, если аудио не может определить
+    previewAudio.ontimeupdate = function () { 
+      if (previewAudio && !seekDrag) { 
+        var dur = previewAudio.duration;
+        if (!dur || !isFinite(dur) || dur === 0 || dur === 30) {
+            dur = parseDuration(t.dur) || 30;
+        }
+        var p = $('#playerProgress'); 
+        if(p) p.style.width = Math.min(100, (previewAudio.currentTime / dur * 100)) + '%'; 
+      } 
+    };
+    
     previewAudio.onended = function () { var p = $('#playerProgress'); if(p) p.style.width = '0%'; var idx = queueIds.indexOf(previewTrackId); if (idx >= 0 && idx < queueIds.length - 1) { var nextT = (trackRegistry[queueIds[idx + 1]] || findTrack(queueIds[idx + 1])); if (nextT && nextT.preview) { playPreview(nextT); return; } } setPlayingUI(false); };
     previewAudio.onplay = function () { setPlayingUI(true); }; previewAudio.onpause = function () { setPlayingUI(false); };
   }
@@ -634,7 +636,21 @@
   var pNext = $('#playerNext'); if (pNext) pNext.addEventListener('click', function () { if (!previewTrackId) return; var q = queueTracks(); var idx = q.findIndex(function (t) { return String(t.id) === String(previewTrackId); }); if (idx >= 0 && idx < q.length - 1) { playPreview(q[idx + 1]); } else if (q.length) { playPreview(q[0]); } });
 
   var seekDrag = false; var seekEl = $('#playerSeek');
-  function seekByPoint(clientX) { if (!seekEl) return; var r = seekEl.getBoundingClientRect(); if (!r.width) return; var p = Math.min(1, Math.max(0, (clientX - r.left) / r.width)); var pr = $('#playerProgress'); if(pr) pr.style.width = (p * 100) + '%'; if (previewAudio && previewAudio.duration && isFinite(previewAudio.duration) && previewAudio.duration > 0) previewAudio.currentTime = p * previewAudio.duration; }
+  function seekByPoint(clientX) { 
+    if (!seekEl) return; 
+    var r = seekEl.getBoundingClientRect(); if (!r.width) return; 
+    var p = Math.min(1, Math.max(0, (clientX - r.left) / r.width)); 
+    var pr = $('#playerProgress'); if(pr) pr.style.width = (p * 100) + '%'; 
+    if (previewAudio) {
+        var tr = findTrack(previewTrackId);
+        var dur = previewAudio.duration;
+        // Если длительность сломана - берем из метаданных
+        if (!dur || !isFinite(dur) || dur === 0 || dur === 30) {
+            dur = (tr ? parseDuration(tr.dur) : 0) || 30;
+        }
+        previewAudio.currentTime = p * dur; 
+    }
+  }
   function seekStart(clientX) { if (!previewAudio) return; seekDrag = true; var pr = $('#playerProgress'); if(pr) pr.classList.add('dragging'); seekByPoint(clientX); setPlayingUI(true); }
   if (seekEl) { seekEl.addEventListener('mousedown', function (e) { e.preventDefault(); seekStart(e.clientX); }); seekEl.addEventListener('touchstart', function (e) { seekStart(e.touches[0].clientX); }, { passive: true }); }
   window.addEventListener('mousemove', function (e) { if (seekDrag) seekByPoint(e.clientX); });
