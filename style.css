@@ -166,8 +166,7 @@ html[data-theme="white"] .logo__music{color:#111418}
 .confirm p{font-size:15px;line-height:1.5;margin-bottom:4px}
 
 /* ===== ПАРЯЩИЙ ПЛЕЕР ===== */
-.floating-player-container{position:fixed;z-index:60;pointer-events:none;display:flex;justify-content:center}
-.floating-player-container[hidden]{display:none !important;}
+.floating-player-container{position:fixed;bottom:80px;left:10px;right:10px;z-index:60;pointer-events:none;display:flex;justify-content:center}
 .player{pointer-events:auto;background:var(--player-bg);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.1);border-radius:28px;display:flex;align-items:center;gap:14px;padding:10px 16px;box-shadow:0 10px 30px rgba(0,0,0,0.5);width:100%;max-width:760px;animation:playerIn .5s cubic-bezier(.22,1,.36,1);position:relative}
 @keyframes playerIn{from{transform:translateY(110%);opacity:0}to{transform:translateY(0);opacity:1}}
 .player[hidden]{display:none}
@@ -253,13 +252,13 @@ html[data-theme="white"] .logo__music{color:#111418}
   .content{padding:18px 16px 160px;margin-bottom:0}
   .page-title{font-size:22px}
   .section-head h2{font-size:20px}
+  .floating-player-container{bottom:80px;left:8px;right:8px}
+  .player__volume{display:none}
   .support-banner{min-height:170px;padding:20px;border-radius:20px;background-position:60% center}
   .support-banner__content{max-width:70%;gap:4px}
   .support-banner__title{font-size:24px}
   .support-banner__desc{font-size:11px}
   .support-banner__button{padding:8px 14px;font-size:11px}
-  .floating-player-container{bottom:80px;left:8px;right:8px}
-  .player__volume{display:none}
 }
 
 /* Десктопное позиционирование плеера */
