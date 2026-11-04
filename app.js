@@ -152,8 +152,11 @@
     $$('.nav__item[data-page]').forEach(function (b) { b.classList.toggle('active', b.getAttribute('data-page') === name); });
     var content = $('.content'); if(content) content.scrollTop = 0;
     
-    // Перезапускаем обсервер для новой страницы
     setTimeout(setupAnimations, 50);
+    if (name === 'mymusic') {
+      // Запускаем фоновое восстановление при заходе на страницу
+      restoreMissingPreviews();
+    }
   }
   $$('.nav__item[data-page]').forEach(function (btn) { btn.addEventListener('click', function () { goPage(btn.getAttribute('data-page')); }); });
   $$('[data-goto]').forEach(function (btn) { btn.addEventListener('click', function () { goPage(btn.getAttribute('data-goto')); }); });
@@ -180,29 +183,67 @@
     });
   }
 
-  async function restorePreview(tr) {
+  // ===== ФОНОВОЕ ВОССТАНОВЛЕНИЕ =====
+  var restorePromises = {};
+  var isRestoringAll = false;
+
+  async function restorePreview(tr, silent) {
     if (tr.preview) return true;
-    toast('Восстанавливаю ссылку...');
-    try {
-      var res = await fetch(API_URL + '/api/search?q=' + encodeURIComponent((tr.artist || '') + ' ' + tr.title));
-      var data = await res.json();
-      if (data.tracks && data.tracks.length > 0) {
-          var newTrack = data.tracks[0];
-          var oldId = tr.id; 
-          
-          tr.preview = newTrack.preview; tr.cover = newTrack.cover; tr.source = newTrack.source; 
-          
-          await fetch(API_URL + '/api/update_preview', {
-              method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, getAuthHeader()),
-              body: JSON.stringify({ id: String(oldId), title: tr.title, artist: tr.artist, preview: tr.preview })
-          });
-          
-          trackRegistry[oldId] = tr;
-          return true;
-      }
-    } catch (e) {}
-    toast('Не удалось найти превью');
-    return false;
+    
+    // Если уже восстанавливается - ждем
+    if (restorePromises[tr.id]) return await restorePromises[tr.id];
+
+    restorePromises[tr.id] = (async function() {
+        if (!silent) toast('Восстанавливаю ссылку...');
+        try {
+          var res = await fetch(API_URL + '/api/search?q=' + encodeURIComponent((tr.artist || '') + ' ' + tr.title));
+          var data = await res.json();
+          if (data.tracks && data.tracks.length > 0) {
+              var newTrack = data.tracks[0];
+              var oldId = tr.id;
+              
+              tr.preview = newTrack.preview; 
+              tr.cover = newTrack.cover || tr.cover; 
+              tr.source = newTrack.source; 
+              
+              await fetch(API_URL + '/api/update_preview', {
+                  method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, getAuthHeader()),
+                  body: JSON.stringify({ id: String(oldId), title: tr.title, artist: tr.artist, preview: tr.preview })
+              });
+              
+              trackRegistry[oldId] = tr;
+              
+              // Обновляем кнопку, чтобы она стала активной
+              var row = document.querySelector('.track[data-id="' + oldId + '"]');
+              if (row) {
+                  var btn = row.querySelector('.js-play');
+                  if (btn) {
+                      // Визуально можно ничего не делать, просто ссылка теперь есть
+                  }
+              }
+              return true;
+          }
+        } catch (e) {}
+        if (!silent) toast('Не удалось найти превью');
+        return false;
+    })();
+
+    return await restorePromises[tr.id];
+  }
+
+  async function restoreMissingPreviews() {
+    if (isRestoringAll) return;
+    isRestoringAll = true;
+    
+    var tracks = (mymusicTab === 'all') ? library : favs;
+    var missing = tracks.filter(function(t) { return !t.preview; });
+    
+    for (var i = 0; i < missing.length; i++) {
+        await restorePreview(missing[i], true); // true = silent (без тостов)
+        await new Promise(r => setTimeout(r, 500)); // пауза 0.5 сек, чтобы не спамить сервер
+    }
+    
+    isRestoringAll = false;
   }
 
   // ===== Отрисовка =====
@@ -254,7 +295,6 @@
     t.cover = ownCover;
     var cover = '<img class="track__cover track__cover-image js-track-cover" data-title="' + esc(t.title || '') + '" data-artist="' + esc(t.artist || '') + '" src="' + ownCover + '" alt="" loading="lazy">';
     
-    // Добавляем класс animate-on-scroll
     return '<div class="track animate-on-scroll" data-id="' + esc(String(t.id)) + '">' + cover +
       '<div class="track__meta"><div class="track__title">' + esc(t.title) + '</div><div class="track__artist">' + esc(t.artist) + (t.dur ? ' · ' + esc(t.dur) : '') + '</div></div>' +
       '<div class="track__actions">' +
@@ -275,7 +315,6 @@
     preloadedAudios[url] = audio;
   }
 
-  // === НАСТРОЙКА АНИМАЦИЙ ===
   var observer;
   function setupAnimations() {
     if (!('IntersectionObserver' in window)) {
@@ -283,7 +322,6 @@
         return;
     }
     if (observer) observer.disconnect();
-    
     observer = new IntersectionObserver(function(entries) {
         entries.forEach(function(entry) {
             if (entry.isIntersecting) {
@@ -292,7 +330,6 @@
             }
         });
     }, { threshold: 0.1, rootMargin: "0px 0px -20px 0px" });
-
     document.querySelectorAll('.animate-on-scroll').forEach(function(el) {
         if (!el.classList.contains('is-visible')) observer.observe(el);
     });
@@ -304,8 +341,6 @@
     hydrateTrackCovers(container); 
     updateRowPlayState(); 
     tracks.slice(0, 5).forEach(function(t) { if (t.preview) preloadAudio(t.preview); });
-    
-    // Запускаем анимацию
     setTimeout(setupAnimations, 50);
   }
 
@@ -317,6 +352,9 @@
     var el = $('#myEmpty'); if(el) el.hidden = tracks.length > 0; 
     var c = $('#myCount'); if(c) c.textContent = 'Треков: ' + tracks.length; 
     renderList($('#myList'), tracks); 
+    
+    // Запускаем фоновое восстановление
+    restoreMissingPreviews();
   }
 
   function renderCollection() { var tracks = library; var el = $('#collEmpty'); if(el) el.hidden = tracks.length > 0; var c = $('#collCount'); if(c) c.textContent = 'Треков: ' + tracks.length; renderList($('#collList'), tracks); }
@@ -426,7 +464,7 @@
   async function triggerPlay(row) {
     if (!row) return; var id = row.getAttribute('data-id'); var tr = findTrack(id); if (!tr) return;
     if (!tr.preview) {
-        var restored = await restorePreview(tr);
+        var restored = await restorePreview(tr, false); // false = показываем тост
         if (!restored) return;
     }
     queueIds = []; row.parentElement.querySelectorAll('.track').forEach(function (r) { queueIds.push(r.getAttribute('data-id')); }); playPreview(tr);
