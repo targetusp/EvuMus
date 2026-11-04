@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 
 import asyncpg
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Depends, Query, Request
+from fastapi import FastAPI, Header, HTTPException, Depends, Query, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -204,18 +204,10 @@ async def add_track_to_playlist(data: PlaylistTrackData, user_id: int = Depends(
     return {"status": "ok"}
 
 # ==========================================
-# ОТПРАВКА В ЧАТ (С ВОДЯНЫМ ЗНАКОМ)
+# ОТПРАВКА В ЧАТ (В ФОНЕ)
 # ==========================================
-@app.post("/api/send_to_chat")
-async def send_to_chat(track: TrackData, user_id: int = Depends(get_user_id)):
-    if not track.preview: raise HTTPException(status_code=400, detail="No preview")
-    audio_url = track.preview
-    if audio_url.startswith('/'):
-        audio_url = os.getenv("API_BASE_URL", "https://evumus.onrender.com") + audio_url
-
+async def send_audio_task(user_id: int, track: TrackData, audio_url: str):
     tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendAudio"
-    
-    # ДОБАВЛЯЕМ ПОДПИСЬ С БОТОМ
     watermark = "\n\n🤖 Скачано через: @EvuMusicBot"
     caption_text = f"🎵 {track.title} — {track.artist}{watermark}"
     
@@ -229,12 +221,24 @@ async def send_to_chat(track: TrackData, user_id: int = Depends(get_user_id)):
     
     try:
         async with httpx.AsyncClient() as client:
-            res = await client.post(tg_url, json=payload, timeout=10.0)
-            # Если аудио не удалось отправить, отправляем текстом с той же ссылкой
+            # Таймаут увеличен, так как файл может скачиваться долго
+            res = await client.post(tg_url, json=payload, timeout=60.0)
             if res.status_code != 200:
                 fallback_text = f"🎵 {track.title}\n{audio_url}{watermark}"
                 await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id": user_id, "text": fallback_text})
-    except Exception: pass
+    except Exception as e:
+        print(f"[SEND ERROR] {e}")
+
+@app.post("/api/send_to_chat")
+async def send_to_chat(track: TrackData, background_tasks: BackgroundTasks, user_id: int = Depends(get_user_id)):
+    if not track.preview: raise HTTPException(status_code=400, detail="No preview")
+    audio_url = track.preview
+    if audio_url.startswith('/'):
+        audio_url = os.getenv("API_BASE_URL", "https://evumus.onrender.com") + audio_url
+
+    # Добавляем задачу в фон и сразу возвращаем ответ
+    background_tasks.add_task(send_audio_task, user_id, track, audio_url)
+    
     return {"status": "ok"}
 
 # ==========================================
