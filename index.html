@@ -38,11 +38,6 @@
           <svg class="nav__icon" viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="6.5" stroke="currentColor" stroke-width="2"/><path d="M16 16l4.5 4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
           <span>Поиск</span>
         </button>
-        <button class="nav__item hide-mobile" data-page="favorites">
-          <svg class="nav__icon" viewBox="0 0 24 24" fill="none"><path d="M12 20.5s-7.5-4.7-7.5-10A4.2 4.2 0 0 1 12 7.5a4.2 4.2 0 0 1 7.5 3c0 5.3-7.5 10-7.5 10z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
-          <span>Любимое</span>
-          <span class="nav__badge" id="favBadge">0</span>
-        </button>
         <button class="nav__item" data-page="playlists">
           <svg class="nav__icon" viewBox="0 0 24 24" fill="none"><path d="M4 7h12M4 12h12M4 17h8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M18 13.5V9l3 1.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="16.5" cy="16" r="2" stroke="currentColor" stroke-width="2"/></svg>
           <span>Плейлисты</span>
@@ -65,6 +60,7 @@
 
     <main class="content" id="content">
 
+      <!-- МОЯ МУЗЫКА (Объединяет все треки и любимое) -->
       <section class="page active" id="page-mymusic">
         <a class="support-banner" href="https://www.donationalerts.com/r/evumusic" target="_blank" rel="noopener noreferrer" aria-label="Поддержать проект EvuMusic на DonationAlerts">
           <span class="support-banner__content">
@@ -80,7 +76,7 @@
           <button class="tab" data-mymusic-tab="fav">Любимое</button>
         </div>
         <div class="section-head">
-          <h2>Моя музыка</h2>
+          <h2 id="myPageTitle">Моя музыка</h2>
           <span class="section-count" id="myCount">Треков: 0</span>
         </div>
         <div class="card empty-card" id="myEmpty">
@@ -91,6 +87,7 @@
         <div class="track-list" id="myList"></div>
       </section>
 
+      <!-- ПОИСК -->
       <section class="page" id="page-search">
         <div class="tabs">
           <button class="tab active" data-search-tab="tracks">Треки</button>
@@ -122,23 +119,7 @@
         <div class="track-list" id="collList"></div>
       </section>
 
-      <section class="page" id="page-favorites">
-        <div class="tabs">
-          <button class="tab" data-fav-tab="all">Все треки</button>
-          <button class="tab active" data-fav-tab="fav">Любимое</button>
-        </div>
-        <div class="section-head">
-          <h2 id="favTitle">Любимое</h2>
-          <span class="section-count" id="favCount">Треков: 0</span>
-        </div>
-        <div class="card empty-card" id="favEmpty">
-          <h3>Здесь пока нет треков</h3>
-          <p>Добавляй музыку из поиска и собирай свои плейлисты.</p>
-          <button class="btn-primary" data-goto="search">Перейти к поиску</button>
-        </div>
-        <div class="track-list" id="favList"></div>
-      </section>
-
+      <!-- ПЛЕЙЛИСТЫ -->
       <section class="page" id="page-playlists">
         <div class="section-head playlists-head">
           <h2>Плейлисты</h2>
@@ -156,6 +137,7 @@
         </div>
       </section>
 
+      <!-- АЛЬБОМЫ -->
       <section class="page" id="page-albums">
         <div class="section-head playlists-head">
           <h2>Альбомы</h2>
@@ -166,6 +148,7 @@
         <div class="empty-hint" id="albumEmpty">Пока нет альбомов. Создай первый!</div>
       </section>
 
+      <!-- ПРОСМОТР АЛЬБОМА -->
       <section class="page" id="page-alview">
         <div class="section-head playlists-head">
           <button class="btn-back" id="albumBack" aria-label="Назад">←</button>
@@ -175,6 +158,7 @@
         <p class="search-empty" id="albumViewEmpty" hidden>В альбоме пока пусто</p>
       </section>
 
+      <!-- ПРОСМОТР ПЛЕЙЛИСТА -->
       <section class="page" id="page-plview">
         <div class="section-head playlists-head">
           <button class="btn-back" id="plBack" aria-label="Назад">←</button>
@@ -184,6 +168,7 @@
         <p class="search-empty" id="plViewEmpty" hidden>В плейлисте пока пусто</p>
       </section>
 
+      <!-- НАСТРОЙКИ -->
       <section class="page" id="page-settings">
         <h1 class="page-title">Настройки</h1>
 
@@ -302,7 +287,6 @@
           <span class="theme-option__desc">Тёмная</span>
         </button>
       </div>
-      <label class="glass-toggle"><input type="checkbox" id="glassModeToggle"><span class="glass-toggle__switch"></span><span><b>Стеклянный режим</b><small>Полупрозрачные панели и размытие</small></span></label>
       <button class="btn-primary modal__close" id="closeThemeModal">Готово</button>
     </div>
   </div>
@@ -313,10 +297,6 @@
       <div class="language-list" id="languageList">
         <button class="language-option" data-lang="ru">🇷🇺 Русский</button>
         <button class="language-option" data-lang="en">🇬🇧 English</button>
-        <button class="language-option" data-lang="uk">🇺🇦 Українська</button>
-        <button class="language-option" data-lang="de">🇩🇪 Deutsch</button>
-        <button class="language-option" data-lang="fr">🇫🇷 Français</button>
-        <button class="language-option" data-lang="es">🇪🇸 Español</button>
       </div>
       <button class="btn-primary modal__close" id="closeLanguageModal">Готово</button>
     </div>
@@ -344,7 +324,7 @@
     </div>
   </div>
 
-      <div class="modal-overlay" id="addToPlaylistModal" hidden>
+  <div class="modal-overlay" id="addToPlaylistModal" hidden>
     <div class="modal">
       <h3 class="modal__title">Добавить в плейлист</h3>
       <div class="playlist-pick-list" id="playlistPickList"></div>
