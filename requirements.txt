@@ -3,3 +3,5 @@ uvicorn[standard]==0.30.6
 asyncpg>=0.30.0
 python-dotenv==1.0.1
 pydantic==2.9.2
+httpx==0.27.2
+yandex-music==3.2.2
