@@ -1,103 +1,198 @@
+
 import 'dotenv/config';
 import express from 'express';
 import path from 'node:path';
+import fs from 'node:fs';
+import http from 'node:http';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
 import pg from 'pg';
-import { Bot, InlineKeyboard, GrammyError, HttpError } from 'grammy';
+import { Bot, InlineKeyboard } from 'grammy';
 
 const { Pool } = pg;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
+const PYTHON_DIR = path.join(ROOT, 'ru-backend');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
+const DATABASE_URL = process.env.DATABASE_URL;
 const WEBAPP_URL = (process.env.WEBAPP_URL || 'http://localhost:8080').replace(/\/+$/, '');
 const PORT = Number(process.env.PORT || 8080);
-const ADMIN_IDS = (process.env.ADMIN_IDS || '')
-  .split(',').map((s) => s.trim()).filter(Boolean).map(Number);
-const MUSIC_CHANNELS = (process.env.MUSIC_CHANNELS || process.env.MUSIC_CHANNEL || '').split(',').map(function(s){return s.trim().replace(/^@/,'');}).filter(Boolean);
+const PYTHON_API_PORT = Number(process.env.PYTHON_API_PORT || 8001);
+const PYTHON_HOST = '127.0.0.1';
 
-if (!BOT_TOKEN) { console.error('BOT_TOKEN missing'); process.exit(1); }
+const ADMIN_IDS = (process.env.ADMIN_IDS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean)
+  .map(Number);
+
+const MUSIC_CHANNELS = (
+  process.env.MUSIC_CHANNELS || process.env.MUSIC_CHANNEL || ''
+)
+  .split(',')
+  .map(s => s.trim().replace(/^@/, ''))
+  .filter(Boolean);
+
+if (!BOT_TOKEN) throw new Error('BOT_TOKEN не задан в Environment');
+if (!DATABASE_URL) throw new Error('DATABASE_URL не задан в Environment');
+
+const PYTHON_FILE = ['main.py', 'api.py']
+  .map(name => path.join(PYTHON_DIR, name))
+  .find(file => fs.existsSync(file));
+
+if (!PYTHON_FILE) {
+  throw new Error('Не найден ru-backend/main.py или ru-backend/api.py');
+}
+
+const PYTHON_MODULE = path.basename(PYTHON_FILE, '.py');
+const PYTHON_BIN = process.env.PYTHON_BIN || '/opt/venv/bin/python';
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL?.includes('neon.tech') ? { rejectUnauthorized: false } : undefined,
+  connectionString: DATABASE_URL,
+  ssl: DATABASE_URL.includes('neon.tech')
+    ? { rejectUnauthorized: false }
+    : undefined,
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
 });
 
-/* ================= DB ================= */
+/* ================= DATABASE ================= */
 
 async function upsertUser(user, invitedBy = null) {
   const isAdmin = ADMIN_IDS.includes(user.id);
+
   await pool.query(
-    `INSERT INTO users (telegram_id, username, first_name, last_name, language_code, is_admin, invited_by)
+    `INSERT INTO users
+      (telegram_id, username, first_name, last_name, language_code, is_admin, invited_by)
      VALUES ($1,$2,$3,$4,$5,$6,$7)
      ON CONFLICT (telegram_id) DO UPDATE SET
-       username=EXCLUDED.username, first_name=EXCLUDED.first_name, last_name=EXCLUDED.last_name,
-       language_code=EXCLUDED.language_code, is_admin=EXCLUDED.is_admin, last_seen_at=now()`,
-    [user.id, user.username || null, user.first_name || null, user.last_name || null,
-     user.language_code || 'ru', isAdmin, invitedBy]
+       username=EXCLUDED.username,
+       first_name=EXCLUDED.first_name,
+       last_name=EXCLUDED.last_name,
+       language_code=EXCLUDED.language_code,
+       is_admin=EXCLUDED.is_admin,
+       last_seen_at=now()`,
+    [
+      user.id,
+      user.username || null,
+      user.first_name || null,
+      user.last_name || null,
+      user.language_code || 'ru',
+      isAdmin,
+      invitedBy
+    ]
   );
 }
 
 async function saveTrackFromChannel(msg) {
   const audio = msg.audio || msg.voice;
   if (!audio) return null;
+
   const title = audio.title || msg.caption || 'Без названия';
-  const artist = audio.performer || (msg.caption_entities ? '' : '') || 'Неизвестен';
-  const duration = audio.duration ? `${Math.floor(audio.duration / 60)}:${String(audio.duration % 60).padStart(2, '0')}` : null;
-  const fileId = audio.file_id;
+  const artist = audio.performer || 'Неизвестен';
+  const duration = audio.duration
+    ? `${Math.floor(audio.duration / 60)}:${String(audio.duration % 60).padStart(2, '0')}`
+    : null;
+
   const uniqueKey = `${title}|${artist}`.toLowerCase();
 
   const { rows } = await pool.query(
-    `INSERT INTO channel_tracks (file_id, title, artist, duration, unique_key, message_id)
+    `INSERT INTO channel_tracks
+      (file_id, title, artist, duration, unique_key, message_id)
      VALUES ($1,$2,$3,$4,$5,$6)
-     ON CONFLICT (unique_key) DO UPDATE SET file_id=EXCLUDED.file_id, title=EXCLUDED.title, artist=EXCLUDED.artist, updated_at=now()
+     ON CONFLICT (unique_key) DO UPDATE SET
+       file_id=EXCLUDED.file_id,
+       title=EXCLUDED.title,
+       artist=EXCLUDED.artist,
+       updated_at=now()
      RETURNING id`,
-    [fileId, title, artist, duration, uniqueKey, msg.message_id]
+    [
+      audio.file_id,
+      title,
+      artist,
+      duration,
+      uniqueKey,
+      msg.message_id
+    ]
   );
+
   return rows[0];
 }
 
 async function searchTracks(q, limit = 30) {
   const { rows } = await pool.query(
-    `SELECT id, title, artist, duration FROM channel_tracks
+    `SELECT id, title, artist, duration
+     FROM channel_tracks
      WHERE title ILIKE $1 OR artist ILIKE $1
-     ORDER BY title LIMIT $2`,
+     ORDER BY title
+     LIMIT $2`,
     [`%${q}%`, limit]
   );
+
   return rows;
 }
 
 async function getTrack(id) {
-  const { rows } = await pool.query('SELECT * FROM channel_tracks WHERE id=$1', [id]);
+  const { rows } = await pool.query(
+    'SELECT * FROM channel_tracks WHERE id=$1',
+    [id]
+  );
+
   return rows[0] || null;
 }
 
 async function useInviteCode(code, telegramId) {
   const client = await pool.connect();
+
   try {
     await client.query('BEGIN');
+
     const { rows } = await client.query(
-      `SELECT created_by FROM invite_codes WHERE code=$1 AND used_by IS NULL FOR UPDATE`, [code]);
-    if (!rows.length) { await client.query('ROLLBACK'); return { ok: false }; }
+      `SELECT created_by
+       FROM invite_codes
+       WHERE code=$1 AND used_by IS NULL
+       FOR UPDATE`,
+      [code]
+    );
+
+    if (!rows.length) {
+      await client.query('ROLLBACK');
+      return { ok: false };
+    }
+
     await client.query(
-      `UPDATE invite_codes SET used_by=$1, used_at=now() WHERE code=$2 AND used_by IS NULL`,
-      [telegramId, code]);
+      `UPDATE invite_codes
+       SET used_by=$1, used_at=now()
+       WHERE code=$2 AND used_by IS NULL`,
+      [telegramId, code]
+    );
+
     await client.query('COMMIT');
+
     return { ok: true, inviter: rows[0].created_by };
-  } catch (e) {
+  } catch (error) {
     await client.query('ROLLBACK');
-    throw e;
-  } finally { client.release(); }
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function createInviteCode(telegramId) {
   const code = crypto.randomBytes(4).toString('hex');
-  await pool.query(`INSERT INTO invite_codes (code, created_by) VALUES ($1,$2)`, [code, telegramId]);
+
+  await pool.query(
+    'INSERT INTO invite_codes (code, created_by) VALUES ($1,$2)',
+    [code, telegramId]
+  );
+
   return code;
 }
 
-/* ================= Bot ================= */
+/* ================= TELEGRAM BOT ================= */
 
 const bot = new Bot(BOT_TOKEN);
 
@@ -111,20 +206,26 @@ function startKb() {
     .url('Канал с обновлениями', 'https://t.me/EvuMusic');
 }
 
-bot.command('start', async (ctx) => {
+bot.command('start', async ctx => {
   const payload = ctx.match || '';
   let invitedBy = null;
+
   if (payload.startsWith('ref_')) {
     const id = Number(payload.slice(4));
     if (Number.isFinite(id)) invitedBy = id;
   }
+
   if (payload.startsWith('inv_')) {
     try {
-      const res = await useInviteCode(payload.slice(4), ctx.from.id);
-      if (res.ok) invitedBy = res.inviter;
-    } catch (e) { console.error(e); }
+      const result = await useInviteCode(payload.slice(4), ctx.from.id);
+      if (result.ok) invitedBy = result.inviter;
+    } catch (error) {
+      console.error('Invite error:', error);
+    }
   }
+
   await upsertUser(ctx.from, invitedBy);
+
   await ctx.reply(
     'Твоя музыка, всегда рядом.\n\n' +
     'Напиши название песни или открой плеер: поиск, любимые треки и личные плейлисты.',
@@ -132,11 +233,13 @@ bot.command('start', async (ctx) => {
   );
 });
 
-bot.command('app', async (ctx) => {
-  await ctx.reply('Открывай EvuMusic 👇', { reply_markup: appBtn() });
+bot.command('app', async ctx => {
+  await ctx.reply('Открывай EvuMusic 👇', {
+    reply_markup: appBtn()
+  });
 });
 
-bot.command('help', async (ctx) => {
+bot.command('help', async ctx => {
   await ctx.reply(
     'EvuMusic — закрытый музыкальный клуб.\n\n' +
     '/start — открыть приложение\n' +
@@ -148,195 +251,548 @@ bot.command('help', async (ctx) => {
   );
 });
 
-bot.command('search', async (ctx) => {
+bot.command('search', async ctx => {
   const q = (ctx.match || '').toString().trim();
-  if (!q) { await ctx.reply('Используй: /search название'); return; }
+
+  if (!q) {
+    await ctx.reply('Используй: /search название');
+    return;
+  }
+
   const tracks = await searchTracks(q, 10);
-  if (!tracks.length) { await ctx.reply('Ничего не нашёл 😔'); return; }
-  const kb = new InlineKeyboard();
-  tracks.forEach((t) => kb.text(`${t.title} — ${t.artist || ''}`.slice(0, 60), `play:${t.id}`));
-  await ctx.reply(`Нашёл ${tracks.length}:`, { reply_markup: kb });
-});
 
-bot.command('invite', async (ctx) => {
-  const can = ADMIN_IDS.includes(ctx.from.id) ||
-    (await pool.query('SELECT is_admin FROM users WHERE telegram_id=$1', [ctx.from.id])).rows[0]?.is_admin;
-  if (!can) { await ctx.reply('Инвайты выдаёт администрация.'); return; }
-  const code = await createInviteCode(ctx.from.id);
-  const me = await bot.api.getMe();
-  await ctx.reply(
-    `Код: <code>${code}</code>\nСсылка: https://t.me/${me.username}?start=inv_${code}`,
-    { parse_mode: 'HTML', reply_markup: appBtn() }
-  );
-});
+  if (!tracks.length) {
+    await ctx.reply('Ничего не нашёл 😔');
+    return;
+  }
 
-bot.command('stats', async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from.id)) return;
-  const { rows } = await pool.query(`
-    SELECT
-      (SELECT count(*) FROM users) users,
-      (SELECT count(*) FROM users WHERE last_seen_at > now() - interval '7 days') active,
-      (SELECT count(*) FROM channel_tracks) tracks,
-      (SELECT count(*) FROM invite_codes WHERE used_by IS NOT NULL) invites
-  `);
-  const s = rows[0];
-  await ctx.reply(`👥 ${s.users} | ⚡ ${s.active} | 🎵 ${s.tracks} | 🎟 ${s.invites}`);
-});
+  const keyboard = new InlineKeyboard();
 
-/* play callback — прислать трек */
-bot.callbackQuery(/^play:(\d+)$/, async (ctx) => {
-  const id = Number(ctx.match[1]);
-  const t = await getTrack(id);
-  if (!t) { await ctx.answerCallbackQuery('Трек не найден'); return; }
-  await ctx.answerCallbackQuery();
-  await ctx.replyWithAudio(t.file_id, {
-    title: t.title,
-    performer: t.artist || undefined,
-    caption: `${t.title} — ${t.artist || ''}`,
+  tracks.forEach(track => {
+    keyboard.text(
+      `${track.title} — ${track.artist || ''}`.slice(0, 60),
+      `play:${track.id}`
+    );
+  });
+
+  await ctx.reply(`Нашёл ${tracks.length}:`, {
+    reply_markup: keyboard
   });
 });
 
-/* сохраняем музыку из канала (бот — админ канала) */
-bot.on('channel_post', async (ctx) => {
-  try {
-    if (MUSIC_CHANNELS.length && ctx.chat.username && !MUSIC_CHANNELS.some(function(ch){return ch.toLowerCase()===ctx.chat.username.toLowerCase();})) return;
-    const saved = await saveTrackFromChannel(ctx.message || ctx.channelPost);
-    if (saved) console.log('Saved track from channel:', saved.id);
-  } catch (e) { console.error('channel_post save error', e); }
+bot.command('invite', async ctx => {
+  const result = await pool.query(
+    'SELECT is_admin FROM users WHERE telegram_id=$1',
+    [ctx.from.id]
+  );
+
+  const can = ADMIN_IDS.includes(ctx.from.id) ||
+    result.rows[0]?.is_admin;
+
+  if (!can) {
+    await ctx.reply('Инвайты выдаёт администрация.');
+    return;
+  }
+
+  const code = await createInviteCode(ctx.from.id);
+  const me = await bot.api.getMe();
+
+  await ctx.reply(
+    `Код: <code>${code}</code>\nСсылка: https://t.me/${me.username}?start=inv_${code}`,
+    {
+      parse_mode: 'HTML',
+      reply_markup: appBtn()
+    }
+  );
 });
 
-/* аудио в ЛС (sync.py пересылает файлы боту) */
-bot.on('message:audio', async (ctx) => {
+bot.command('stats', async ctx => {
+  if (!ADMIN_IDS.includes(ctx.from.id)) return;
+
+  const { rows } = await pool.query(`
+    SELECT
+      (SELECT count(*) FROM users) users,
+      (SELECT count(*) FROM users
+       WHERE last_seen_at > now() - interval '7 days') active,
+      (SELECT count(*) FROM channel_tracks) tracks,
+      (SELECT count(*) FROM invite_codes
+       WHERE used_by IS NOT NULL) invites
+  `);
+
+  const stats = rows[0];
+
+  await ctx.reply(
+    `👥 ${stats.users} | ⚡ ${stats.active} | 🎵 ${stats.tracks} | 🎟 ${stats.invites}`
+  );
+});
+
+bot.callbackQuery(/^play:(\d+)$/, async ctx => {
+  const id = Number(ctx.match[1]);
+  const track = await getTrack(id);
+
+  if (!track) {
+    await ctx.answerCallbackQuery('Трек не найден');
+    return;
+  }
+
+  await ctx.answerCallbackQuery();
+
+  await ctx.replyWithAudio(track.file_id, {
+    title: track.title,
+    performer: track.artist || undefined,
+    caption: `${track.title} — ${track.artist || ''}`
+  });
+});
+
+bot.on('channel_post', async ctx => {
+  try {
+    if (
+      MUSIC_CHANNELS.length &&
+      ctx.chat.username &&
+      !MUSIC_CHANNELS.some(
+        channel => channel.toLowerCase() === ctx.chat.username.toLowerCase()
+      )
+    ) return;
+
+    const saved = await saveTrackFromChannel(ctx.message || ctx.channelPost);
+
+    if (saved) {
+      console.log('Saved track from channel:', saved.id);
+    }
+  } catch (error) {
+    console.error('channel_post save error:', error);
+  }
+});
+
+bot.on('message:audio', async ctx => {
   try {
     const saved = await saveTrackFromChannel(ctx.message);
+
     if (saved) {
       console.log('Saved track from DM:', saved.id, saved.title);
+
       if (ADMIN_IDS.includes(ctx.from.id)) {
         await ctx.reply(`✅ Сохранено: ${saved.title}`);
       }
     }
-  } catch (e) { console.error('audio save error', e); }
+  } catch (error) {
+    console.error('audio save error:', error);
+  }
 });
 
-bot.on('message:voice', async (ctx) => {
-  try { await saveTrackFromChannel(ctx.message); } catch (e) { console.error(e); }
+bot.on('message:voice', async ctx => {
+  try {
+    await saveTrackFromChannel(ctx.message);
+  } catch (error) {
+    console.error('voice save error:', error);
+  }
 });
 
-/* любой текст — подсказка */
-bot.on('message:text', async (ctx) => {
+bot.on('message:text', async ctx => {
   if (ctx.message.text.startsWith('/')) return;
+
   const q = ctx.message.text.trim();
+
   if (q.length >= 2) {
     const tracks = await searchTracks(q, 8);
+
     if (tracks.length) {
-      const kb = new InlineKeyboard();
-      tracks.forEach((t) => kb.text(`${t.title}`.slice(0, 50), `play:${t.id}`));
-      await ctx.reply(`По запросу «${q}»:`, { reply_markup: kb });
+      const keyboard = new InlineKeyboard();
+
+      tracks.forEach(track => {
+        keyboard.text(
+          `${track.title}`.slice(0, 50),
+          `play:${track.id}`
+        );
+      });
+
+      await ctx.reply(`По запросу «${q}»:`, {
+        reply_markup: keyboard
+      });
+
       return;
     }
   }
-  await ctx.reply('Открой приложение для поиска 👇', { reply_markup: appBtn('Открыть поиск') });
+
+  await ctx.reply('Открой приложение для поиска 👇', {
+    reply_markup: appBtn('Открыть поиск')
+  });
 });
 
-bot.catch((err) => console.error('Bot error', err.error));
+bot.catch(error => {
+  console.error('Bot error:', error.error);
+});
 
 /* ================= API ================= */
 
 function validInitData(initData) {
-  if (!initData) return false;
+  if (!initData || !BOT_TOKEN) return false;
+
   try {
-    const url = new URLSearchParams(initData);
-    const hash = url.get('hash') || '';
-    url.delete('hash');
-    const pairs = [...url.entries()].sort(([a], [b]) => a.localeCompare(b));
-    const dataCheck = pairs.map(([k, v]) => `${k}=${v}`).join('\n');
-    const secret = crypto.createHmac('sha256', 'WebAppData').update(BOT_TOKEN).digest();
-    const expected = crypto.createHmac('sha256', secret).update(dataCheck).digest('hex');
-    return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(expected));
-  } catch { return false; }
+    const params = new URLSearchParams(initData);
+    const hash = params.get('hash') || '';
+
+    params.delete('hash');
+
+    const pairs = [...params.entries()]
+      .sort(([a], [b]) => a.localeCompare(b));
+
+    const dataCheck = pairs
+      .map(([key, value]) => `${key}=${value}`)
+      .join('\n');
+
+    const secret = crypto
+      .createHmac('sha256', 'WebAppData')
+      .update(BOT_TOKEN)
+      .digest();
+
+    const expected = crypto
+      .createHmac('sha256', secret)
+      .update(dataCheck)
+      .digest('hex');
+
+    const actualBuffer = Buffer.from(hash, 'hex');
+    const expectedBuffer = Buffer.from(expected, 'hex');
+
+    return actualBuffer.length === expectedBuffer.length &&
+      actualBuffer.length > 0 &&
+      crypto.timingSafeEqual(actualBuffer, expectedBuffer);
+  } catch {
+    return false;
+  }
 }
 
 function userFromInitData(initData) {
-  const url = new URLSearchParams(initData);
-  const user = url.get('user');
-  if (!user) return null;
-  try { return JSON.parse(user); } catch { return null; }
+  try {
+    const params = new URLSearchParams(initData);
+    const user = params.get('user');
+    return user ? JSON.parse(user) : null;
+  } catch {
+    return null;
+  }
 }
 
 const app = express();
-app.use(express.json());
 
-/* статика сайта */
-app.use(express.static(ROOT, { index: 'index.html' }));
-
-/* поиск */
-app.get('/api/search', async (req, res) => {
-  const q = String(req.query.q || '').trim();
-  if (q.length < 2) return res.json({ tracks: [] });
-  const tracks = await searchTracks(q, 30);
-  res.json({ tracks: tracks.map((t) => ({ id: t.id, title: t.title, artist: t.artist, duration: t.duration })) });
-});
-
-/* треки канала (лента) */
-app.get('/api/tracks', async (_req, res) => {
-  const { rows } = await pool.query(
-    `SELECT id, title, artist, duration FROM channel_tracks ORDER BY id DESC LIMIT 50`);
-  res.json({ tracks: rows });
-});
-
-/* прислать трек в чат */
-app.post('/api/send', async (req, res) => {
-  const { initData, trackId } = req.body || {};
-  const user = userFromInitData(initData);
-  if (!user || !validInitData(initData)) return res.status(401).json({ error: 'auth' });
-  const t = await getTrack(Number(trackId));
-  if (!t) return res.status(404).json({ error: 'not_found' });
+/* Node API: поиск по локальной базе канала */
+app.get('/api/channel-search', async (req, res) => {
   try {
-    await bot.api.sendAudio(user.id, t.file_id, {
-      title: t.title,
-      performer: t.artist || undefined,
-      caption: `${t.title} — ${t.artist || ''}`,
+    const q = String(req.query.q || '').trim();
+
+    if (q.length < 2) return res.json({ tracks: [] });
+
+    const tracks = await searchTracks(q, 30);
+
+    res.json({
+      tracks: tracks.map(track => ({
+        id: track.id,
+        title: track.title,
+        artist: track.artist,
+        duration: track.duration
+      }))
     });
-    await upsertUser(user);
-    res.json({ ok: true });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'send_failed', description: e.description || e.message });
+  } catch (error) {
+    console.error('Channel search error:', error);
+    res.status(500).json({ error: 'channel_search_failed' });
   }
 });
 
-/* расширенный поиск — музыка из канала + локальная подсказка */
+/* Треки из Telegram-канала */
+app.get('/api/tracks', async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, title, artist, duration
+       FROM channel_tracks
+       ORDER BY id DESC
+       LIMIT 50`
+    );
+
+    res.json({ tracks: rows });
+  } catch (error) {
+    console.error('Tracks error:', error);
+    res.status(500).json({ error: 'tracks_failed' });
+  }
+});
+
+/* Отправка трека пользователю в Telegram */
+app.post('/api/send', express.json(), async (req, res) => {
+  try {
+    const { initData, trackId } = req.body || {};
+    const user = userFromInitData(initData);
+
+    if (!user || !validInitData(initData)) {
+      return res.status(401).json({ error: 'auth' });
+    }
+
+    const track = await getTrack(Number(trackId));
+
+    if (!track) {
+      return res.status(404).json({ error: 'not_found' });
+    }
+
+    await bot.api.sendAudio(user.id, track.file_id, {
+      title: track.title,
+      performer: track.artist || undefined,
+      caption: `${track.title} — ${track.artist || ''}`
+    });
+
+    await upsertUser(user);
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Send track error:', error);
+
+    res.status(500).json({
+      error: 'send_failed',
+      description: error.description || error.message
+    });
+  }
+});
+
+/* Расширенный поиск по локальной базе */
 app.get('/api/advanced', async (req, res) => {
-  const q = String(req.query.q || '').trim();
-  if (q.length < 2) return res.json({ tracks: [] });
-  const tracks = await searchTracks(q, 50);
+  try {
+    const q = String(req.query.q || '').trim();
+
+    if (q.length < 2) return res.json({ tracks: [] });
+
+    const tracks = await searchTracks(q, 50);
+
+    res.json({
+      tracks: tracks.map(track => ({
+        id: track.id,
+        title: track.title,
+        artist: track.artist,
+        duration: track.duration,
+        source: 'channel'
+      }))
+    });
+  } catch (error) {
+    console.error('Advanced search error:', error);
+    res.status(500).json({ error: 'advanced_search_failed' });
+  }
+});
+
+/* Проверка состояния обоих серверов */
+app.get('/api/health', (_req, res) => {
   res.json({
-    tracks: tracks.map((t) => ({
-      id: t.id, title: t.title, artist: t.artist, duration: t.duration, source: 'channel',
-    })),
+    ok: true,
+    node: true,
+    python: pythonReady
   });
 });
 
-/* health */
-app.get('/api/health', (_req, res) => res.json({ ok: true }));
+/* ================= PYTHON PROCESS ================= */
 
-/* ================= Start ================= */
+let pythonReady = false;
+let pythonProcess = null;
 
-bot.api.setMyCommands([
-  { command: 'start', description: 'Открыть EvuMusic' },
-  { command: 'app', description: 'Кнопка приложения' },
-  { command: 'search', description: 'Поиск трека' },
-  { command: 'invite', description: 'Создать инвайт' },
-  { command: 'help', description: 'Помощь' },
-  { command: 'stats', description: 'Статистика (админ)' },
-]);
+function startPython() {
+  pythonProcess = spawn(
+    PYTHON_BIN,
+    [
+      '-m',
+      'uvicorn',
+      `${PYTHON_MODULE}:app`,
+      '--app-dir',
+      PYTHON_DIR,
+      '--host',
+      PYTHON_HOST,
+      '--port',
+      String(PYTHON_API_PORT)
+    ],
+    {
+      cwd: PYTHON_DIR,
+      env: {
+        ...process.env,
+        PYTHONUNBUFFERED: '1'
+      },
+      stdio: ['ignore', 'pipe', 'pipe']
+    }
+  );
 
-bot.start({
-  onStart: (me) => console.log(`Bot @${me.username} online`),
+  pythonProcess.stdout.on('data', data => {
+    const output = data.toString();
+    console.log(`[Python] ${output.trim()}`);
+
+    if (
+      output.includes('Application startup complete') ||
+      output.includes('Uvicorn running')
+    ) {
+      pythonReady = true;
+    }
+  });
+
+  pythonProcess.stderr.on('data', data => {
+    console.error(`[Python] ${data.toString().trim()}`);
+  });
+
+  pythonProcess.on('error', error => {
+    console.error('Python process error:', error);
+  });
+
+  pythonProcess.on('exit', (code, signal) => {
+    pythonReady = false;
+    console.error(`Python stopped: code=${code}, signal=${signal}`);
+
+    if (!shuttingDown) {
+      console.error('Python API завершился. Перезапуск контейнера.');
+      process.exit(1);
+    }
+  });
+}
+
+/* ================= PYTHON API PROXY ================= */
+
+/*
+  Все остальные /api/* маршруты идут в FastAPI.
+  Node-маршруты выше имеют приоритет.
+  Поток запроса/ответа сохраняется, включая Range для аудио.
+*/
+
+function proxyToPython(req, res) {
+  const options = {
+    hostname: PYTHON_HOST,
+    port: PYTHON_API_PORT,
+    path: req.originalUrl,
+    method: req.method,
+    headers: {
+      ...req.headers,
+      host: `${PYTHON_HOST}:${PYTHON_API_PORT}`
+    }
+  };
+
+  const proxyRequest = http.request(options, proxyResponse => {
+    res.status(proxyResponse.statusCode || 502);
+
+    for (const [key, value] of Object.entries(proxyResponse.headers)) {
+      if (value !== undefined) {
+        res.setHeader(key, value);
+      }
+    }
+
+    proxyResponse.pipe(res);
+  });
+
+  proxyRequest.on('error', error => {
+    console.error('Python proxy error:', error.message);
+
+    if (!res.headersSent) {
+      res.status(502).json({
+        error: 'python_backend_unavailable',
+        message: 'Python API временно недоступен'
+      });
+    } else {
+      res.destroy(error);
+    }
+  });
+
+  req.pipe(proxyRequest);
+
+  res.on('close', () => {
+    if (!proxyRequest.destroyed) {
+      proxyRequest.destroy();
+    }
+  });
+}
+
+/* Статика сайта */
+app.use(express.static(ROOT, {
+  index: 'index.html',
+  extensions: ['html']
+}));
+
+/* OPTIONS для API */
+app.options(/^\/api\/.*/, (_req, res) => {
+  res.sendStatus(204);
 });
 
-app.listen(PORT, () => {
-  console.log(`EvuMusic server → http://localhost:${PORT}`);
-  console.log(`WebApp URL: ${WEBAPP_URL}`);
-  if (MUSIC_CHANNEL) console.log(`Music channel: @${MUSIC_CHANNEL}`);
+/* Остальные API-маршруты обслуживает FastAPI */
+app.use('/api', (req, res) => {
+  proxyToPython(req, res);
+});
+
+/* Неизвестные страницы */
+app.use((req, res) => {
+  if (req.path.startsWith('/api/')) {
+    return res.status(404).json({ error: 'api_route_not_found' });
+  }
+
+  res.status(404).send('Страница не найдена');
+});
+
+/* ================= START / SHUTDOWN ================= */
+
+let httpServer = null;
+let shuttingDown = false;
+
+async function start() {
+  await pool.query('SELECT 1');
+  console.log('Neon PostgreSQL connected');
+
+  startPython();
+
+  await bot.api.setMyCommands([
+    { command: 'start', description: 'Открыть EvuMusic' },
+    { command: 'app', description: 'Кнопка приложения' },
+    { command: 'search', description: 'Поиск трека' },
+    { command: 'invite', description: 'Создать инвайт' },
+    { command: 'help', description: 'Помощь' },
+    { command: 'stats', description: 'Статистика (админ)' }
+  ]);
+
+  httpServer = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`EvuMusic server listening on port ${PORT}`);
+    console.log(`WebApp URL: ${WEBAPP_URL}`);
+    console.log(`Python API: http://${PYTHON_HOST}:${PYTHON_API_PORT}`);
+    console.log(`Python file: ${PYTHON_FILE}`);
+
+    if (MUSIC_CHANNELS.length) {
+      console.log(`Music channels: ${MUSIC_CHANNELS.map(ch => '@' + ch).join(', ')}`);
+    }
+  });
+
+  bot.start({
+    onStart: me => console.log(`Bot @${me.username} online`)
+  }).catch(error => {
+    console.error('Telegram bot polling error:', error);
+    if (!shuttingDown) process.exit(1);
+  });
+}
+
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  console.log(`Shutting down: ${signal}`);
+
+  try {
+    await bot.stop();
+  } catch (error) {
+    console.error('Bot stop error:', error);
+  }
+
+  if (httpServer) {
+    await new Promise(resolve => httpServer.close(resolve));
+  }
+
+  if (pythonProcess && !pythonProcess.killed) {
+    pythonProcess.kill('SIGTERM');
+  }
+
+  try {
+    await pool.end();
+  } catch (error) {
+    console.error('PostgreSQL shutdown error:', error);
+  }
+
+  process.exit(0);
+}
+
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.once('SIGINT', () => shutdown('SIGINT'));
+
+start().catch(error => {
+  console.error('EvuMusic startup failed:', error);
+  process.exit(1);
 });
