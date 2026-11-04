@@ -24,22 +24,18 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-LASTFM_API_KEY = os.getenv("LASTFM_API_KEY", "").strip()
 
 ENABLE_MUZOFOND = os.getenv("MUZOFOND", "1") == "1"
 ENABLE_YANDEX = os.getenv("YANDEX", "1") == "1"
 ENABLE_SOUNDCLOUD = os.getenv("SOUNDCLOUD", "1") == "1"
 YM_TOKEN = os.getenv("YM_TOKEN", "").strip()
 PROXY_SECRET = os.getenv("PROXY_SECRET", "evu-music-proxy-secret").encode()
+
+# Публичный ключ SoundCloud (не требует регистрации)
 DEFAULT_SC_CLIENT_ID = "nIjtjiYnjkOhMyh5xrbqEW12DxeJVnic"
 SC_CLIENT_ID = (os.getenv("SC_CLIENT_ID", "") or DEFAULT_SC_CLIENT_ID).strip()
 SC_API = "https://api-v2.soundcloud.com"
 ITUNES_API = "https://itunes.apple.com"
-LASTFM_API = "https://ws.audioscrobbler.com/2.0"
-VK_API = "https://api.vk.com/method"
-# Публичный токен для поиска (не требует авторизации пользователя)
-VK_TOKEN = os.getenv("VK_TOKEN", "").strip()
-
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 pool: Optional[asyncpg.Pool] = None
@@ -272,7 +268,28 @@ async def soundcloud_search(query: str, limit: int) -> list:
         out = []
         for t in r.json().get("collection", [])[:limit]:
             if not t: continue
-            out.append({"ext_id": str(t["id"]), "title": norm(t.get("title") or "Без названия"), "artist": norm((t.get("user") or {}).get("username") or "Неизвестен"), "duration": int((t.get("duration") or 0) / 1000), "cover": "", "source": "soundcloud", "full": True})
+            
+            # ИЗВЛЕКАЕМ ОБЛОЖКУ ИЗ SOUNDCLOUD (без ключей)
+            artwork = t.get("artwork_url")
+            if artwork:
+                # Меняем размер на большой
+                artwork = artwork.replace("-large.jpg", "-t500x500.jpg")
+            else:
+                # Если нет обложки трека, берем аватарку автора
+                user = t.get("user") or {}
+                artwork = user.get("avatar_url")
+                if artwork:
+                    artwork = artwork.replace("-large.jpg", "-t500x500.jpg")
+            
+            out.append({
+                "ext_id": str(t["id"]), 
+                "title": norm(t.get("title") or "Без названия"), 
+                "artist": norm((t.get("user") or {}).get("username") or "Неизвестен"), 
+                "duration": int((t.get("duration") or 0) / 1000), 
+                "cover": artwork or "", # Отдаем обложку!
+                "source": "soundcloud", 
+                "full": True
+            })
         return out
     except Exception: return []
 
@@ -339,7 +356,7 @@ async def yandex_search(query: str, limit: int) -> list:
     except Exception: return []
 
 # ==========================================
-# ЭНДПОИНТЫ ПОИСКА (ФИЛЬТР 30-СЕКУНДНЫХ)
+# ЭНДПОИНТЫ ПОИСКА
 # ==========================================
 @app.get("/api/search")
 async def search(q: Optional[str] = Query(None), query: Optional[str] = Query(None), limit: int = Query(30, ge=1, le=100)):
@@ -366,7 +383,7 @@ async def search(q: Optional[str] = Query(None), query: Optional[str] = Query(No
     except Exception: return {"tracks": []}
 
 # ==========================================
-# АЛЬБОМЫ И ОБЛОЖКИ (ITUNES + LASTFM + VK ЧЕРЕЗ HTTPX)
+# АЛЬБОМЫ И ОБЛОЖКИ (ITUNES)
 # ==========================================
 @app.get("/api/search/albums")
 async def search_albums(q: Optional[str] = Query(None), query: Optional[str] = Query(None), limit: int = Query(30, ge=1, le=50)):
@@ -430,14 +447,13 @@ async def get_album(album_id: str):
         }
     except Exception: raise HTTPException(status_code=502, detail="Could not load album")
 
-# --- МНОГОУРОВНЕВЫЙ ПОИСК ОБЛОЖЕК (iTunes -> Last.fm -> VK) ---
 @app.get("/api/track-cover")
 async def get_track_cover(title: str = Query(...), artist: str = Query("")):
     title, artist = norm(title), norm(artist)
     if not title: return {"cover": ""}
     search_query = f"{artist} {title}".strip()
 
-    # 1. iTunes (Apple Music)
+    # iTunes для тех треков, у которых нет обложки в SC
     try:
         r = await get_http().get(ITUNES_API + "/search", params={"term": search_query, "entity": "song", "limit": 1})
         if r.status_code == 200:
@@ -446,47 +462,6 @@ async def get_track_cover(title: str = Query(...), artist: str = Query("")):
                 cover_url = tracks[0].get("artworkUrl100", "").replace("100x100bb", "600x600bb")
                 if cover_url: return {"cover": cover_url}
     except Exception: pass
-
-    # 2. Last.fm (огромная база, включая русскую музыку)
-    if LASTFM_API_KEY:
-        try:
-            r = await get_http().get(LASTFM_API, params={
-                "method": "album.getinfo",
-                "artist": artist,
-                "album": title,
-                "api_key": LASTFM_API_KEY,
-                "format": "json"
-            })
-            if r.status_code == 200:
-                data = r.json()
-                if "album" in data and "image" in data["album"]:
-                    for img in data["album"]["image"]:
-                        if img.get("size") == "extralarge":
-                            return {"cover": img["#text"]}
-        except Exception: pass
-
-    # 3. VK (прямой запрос через httpx, без сторонних библиотек)
-    if VK_TOKEN:
-        try:
-            r = await get_http().get(VK_API + "/audio.search", params={
-                "q": search_query,
-                "count": 1,
-                "access_token": VK_TOKEN,
-                "v": "5.131"
-            })
-            if r.status_code == 200:
-                data = r.json()
-                if "response" in data and "items" in data["response"] and data["response"]["items"]:
-                    track = data["response"]["items"][0]
-                    # В VK обложка часто лежит в поле "album" или "photo"
-                    cover_url = None
-                    if "album" in track and "thumb" in track["album"]:
-                        cover_url = track["album"]["thumb"].get("photo_600") or track["album"]["thumb"].get("photo_300")
-                    elif "photo" in track:
-                        cover_url = track["photo"]
-                    if cover_url:
-                        return {"cover": cover_url}
-        except Exception: pass
 
     return {"cover": ""}
 
