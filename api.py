@@ -7,6 +7,7 @@ import hashlib
 import base64
 import asyncio
 import collections
+import time
 from urllib.parse import parse_qsl, urljoin
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -38,6 +39,11 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 pool: Optional[asyncpg.Pool] = None
 _http: Optional[httpx.AsyncClient] = None
 
+# Кеши
+_search_cache = {}
+_album_cache = {}
+_sc_resolve_cache = {}
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global pool, _http
@@ -45,7 +51,6 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("DATABASE_URL environment variable is missing")
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
     
-    # АВТОМИГРАЦИЯ
     async with pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS favorites (
@@ -350,72 +355,88 @@ async def soundcloud_search(query: str, limit: int) -> list:
         return out
     except Exception: return []
 
-# СТРИМИНГ ЗВУКА С SOUNDCLOUD (без скачивания в память)
-@app.api_route("/api/sc/{sc_id}", methods=["GET", "HEAD", "OPTIONS"])
-async def soundcloud_audio(sc_id: str, request: Request):
-    if not ENABLE_SOUNDCLOUD: raise HTTPException(status_code=503, detail="SoundCloud disabled")
+async def prewarm_sc(sc_id):
+    if sc_id in _sc_resolve_cache: return
     try:
         cli = get_http()
         r = await cli.get(SC_API + "/tracks/" + sc_id, params=sc_params())
-        if r.status_code != 200: raise HTTPException(status_code=404, detail="Track not found")
+        if r.status_code != 200: return
         t = r.json()
         trans = (t.get("media") or {}).get("transcodings") or []
-        frag = [x for x in trans if "aac_160k" in (x.get("preset") or "")] or [x for x in trans if x.get("format", {}).get("protocol") == "hls"]
         
-        # Пытаемся найти прямую MP3 ссылку (progressive) - она играет быстрее всего
         prog = [x for x in trans if x.get("format", {}).get("protocol") == "progressive"]
         if prog:
             rl = await cli.get(prog[0]["url"], params=sc_params())
             if rl.status_code == 200:
-                link = rl.json().get("url")
-                # Проксируем прямой стрим
-                req = cli.build_request("GET", link, headers={"Range": request.headers.get("range", "")} if request.headers.get("range") else {})
-                upstream = await cli.send(req, stream=True)
-                out_headers = {"Content-Type": "audio/mpeg", "Accept-Ranges": "bytes", "Access-Control-Allow-Origin": "*"}
-                for h in ("Content-Length", "Content-Range"):
-                    if h in upstream.headers: out_headers[h] = upstream.headers[h]
-                
-                if request.method == "HEAD":
-                    await upstream.aclose()
-                    return Response(status_code=200, headers=out_headers)
-                
-                async def gen_prog():
-                    try:
-                        async for chunk in upstream.aiter_raw(65536): yield chunk
-                    finally: await upstream.aclose()
-                return StreamingResponse(gen_prog(), status_code=200, headers=out_headers)
+                _sc_resolve_cache[sc_id] = {"type": "direct", "url": rl.json().get("url")}
+                return
 
-        # Если MP3 нет, склеиваем HLS на лету (StreamingResponse)
-        if not frag: raise HTTPException(status_code=502, detail="No stream")
+        frag = [x for x in trans if "aac_160k" in (x.get("preset") or "")] or [x for x in trans if x.get("format", {}).get("protocol") == "hls"]
+        if not frag: return
         loc = None
         for x in frag:
             rl = await cli.get(x["url"], params=sc_params())
             if rl.status_code == 200:
                 loc = (rl.json() or {}).get("url")
                 if loc: break
-        if not loc: raise HTTPException(status_code=502, detail="Resolve failed")
+        if not loc: return
         
         pl = await cli.get(loc)
         text = pl.text
         init_m = re.search(r'#EXT-X-MAP:URI="([^"]+)"', text)
         segs = [ln.strip() for ln in text.splitlines() if ln and not ln.startswith("#")]
         
+        _sc_resolve_cache[sc_id] = {
+            "type": "hls",
+            "loc": loc,
+            "init": init_m.group(1) if init_m else None,
+            "segs": segs
+        }
+    except Exception: pass
+
+@app.api_route("/api/sc/{sc_id}", methods=["GET", "HEAD", "OPTIONS"])
+async def soundcloud_audio(sc_id: str, request: Request):
+    if not ENABLE_SOUNDCLOUD: raise HTTPException(status_code=503, detail="SoundCloud disabled")
+    
+    if sc_id not in _sc_resolve_cache:
+        await prewarm_sc(sc_id)
+    
+    cached = _sc_resolve_cache.get(sc_id)
+    if not cached:
+        raise HTTPException(status_code=404, detail="Stream not found")
+
+    cli = get_http()
+
+    if cached["type"] == "direct":
+        headers = {"Range": request.headers["range"]} if request.headers.get("range") else {}
+        req = cli.build_request("GET", cached["url"], headers=headers)
+        upstream = await cli.send(req, stream=True)
+        out_headers = {"Content-Type": "audio/mpeg", "Accept-Ranges": "bytes", "Access-Control-Allow-Origin": "*"}
+        for h in ("Content-Length", "Content-Range"):
+            if h in upstream.headers: out_headers[h] = upstream.headers[h]
+        if request.method == "HEAD":
+            await upstream.aclose()
+            return Response(status_code=200, headers=out_headers)
+        async def gen_direct():
+            try:
+                async for chunk in upstream.aiter_raw(65536): yield chunk
+            finally: await upstream.aclose()
+        return StreamingResponse(gen_direct(), status_code=200, headers=out_headers)
+
+    if cached["type"] == "hls":
         headers = {"Content-Type": "audio/mp4", "Accept-Ranges": "bytes", "Access-Control-Allow-Origin": "*"}
-        
         async def gen_hls():
             try:
-                if init_m:
-                    ri = await cli.get(urljoin(loc, init_m.group(1)))
+                if cached["init"]:
+                    ri = await cli.get(urljoin(cached["loc"], cached["init"]))
                     if ri.status_code == 200: yield ri.content
-                for s in segs:
-                    rs = await cli.get(urljoin(loc, s))
+                for s in cached["segs"]:
+                    rs = await cli.get(urljoin(cached["loc"], s))
                     if rs.status_code == 200: yield rs.content
             except Exception: pass
-            
         return StreamingResponse(gen_hls(), status_code=200, headers=headers)
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+
+    raise HTTPException(status_code=500, detail="Stream error")
 
 _ym_client = None
 def get_ym():
@@ -447,19 +468,23 @@ async def yandex_search(query: str, limit: int) -> list:
     except Exception: return []
 
 # ==========================================
-# ЭНДПОИНТЫ ПОИСКА (ТАЙМАУТ 1.5 СЕК)
+# ЭНДПОИНТЫ ПОИСКА (С КЕШЕМ)
 # ==========================================
 @app.get("/api/search")
 async def search(q: Optional[str] = Query(None), query: Optional[str] = Query(None), limit: int = Query(30, ge=1, le=100)):
     try:
         term = norm(q or query or "")
         if not term: return {"tracks": []}
+        
+        cache_key = f"{term}_{limit}"
+        if cache_key in _search_cache:
+            return _search_cache[cache_key]
+
         tasks = []
         if ENABLE_MUZOFOND: tasks.append(asyncio.create_task(muzofond_search(term, limit)))
         if ENABLE_YANDEX: tasks.append(asyncio.create_task(yandex_search(term, limit)))
         if ENABLE_SOUNDCLOUD: tasks.append(asyncio.create_task(soundcloud_search(term, limit)))
         
-        # Ждем максимум 1.5 секунды
         done, pending = await asyncio.wait(tasks, timeout=1.5)
         for task in pending: task.cancel()
             
@@ -476,11 +501,20 @@ async def search(q: Optional[str] = Query(None), query: Optional[str] = Query(No
         
         merged = [t for t in merged if t.get("full") is not False and t.get("source") not in ("itunes", "deezer")]
         merged = rank(merged, term)[:limit]
-        return {"tracks": [pack(t) for t in merged]}
+        result_tracks = [pack(t) for t in merged]
+        response_data = {"tracks": result_tracks}
+        
+        _search_cache[cache_key] = response_data
+        
+        for t in merged[:5]:
+            if t.get("source") == "soundcloud" and t.get("ext_id"):
+                asyncio.create_task(prewarm_sc(t["ext_id"]))
+                
+        return response_data
     except Exception: return {"tracks": []}
 
 # ==========================================
-# АЛЬБОМЫ И ОБЛОЖКИ
+# АЛЬБОМЫ (С КЕШЕМ)
 # ==========================================
 @app.get("/api/search/albums")
 async def search_albums(q: Optional[str] = Query(None), query: Optional[str] = Query(None), limit: int = Query(30, ge=1, le=50)):
@@ -504,6 +538,11 @@ async def search_albums(q: Optional[str] = Query(None), query: Optional[str] = Q
 @app.get("/api/itunes/album/{album_id}")
 async def get_album(album_id: str):
     if not album_id.isdigit(): raise HTTPException(status_code=400, detail="Invalid ID")
+    
+    # Проверка кеша
+    if album_id in _album_cache:
+        return _album_cache[album_id]
+
     try:
         r = await get_http().get(ITUNES_API + "/lookup", params={"id": album_id, "entity": "song"})
         data = r.json().get("results", [])
@@ -518,7 +557,11 @@ async def get_album(album_id: str):
                 "cover": cover, "preview": t.get("previewUrl", ""), "preview_url": t.get("previewUrl", ""), "stream_url": t.get("previewUrl", ""),
                 "source": "itunes", "full": False,
             })
-        return {"album": {"id": str(album_info.get("collectionId", "")), "title": album_info.get("collectionName", ""), "artist": album_info.get("artistName", ""), "cover": album_info.get("artworkUrl100", "").replace("100x100bb", "600x600bb")}, "tracks": tracks}
+        result = {"album": {"id": str(album_info.get("collectionId", "")), "title": album_info.get("collectionName", ""), "artist": album_info.get("artistName", ""), "cover": album_info.get("artworkUrl100", "").replace("100x100bb", "600x600bb")}, "tracks": tracks}
+        
+        # Сохраняем в кеш
+        _album_cache[album_id] = result
+        return result
     except Exception: raise HTTPException(status_code=502, detail="Error")
 
 @app.get("/api/track-cover")
@@ -536,9 +579,6 @@ async def get_track_cover(title: str = Query(...), artist: str = Query("")):
     except Exception: pass
     return {"cover": ""}
 
-# ==========================================
-# СТРИМИНГ ПРЯМЫХ ССЫЛОК (MUZOFOND)
-# ==========================================
 @app.api_route("/api/stream/{token}", methods=["GET", "HEAD", "OPTIONS"])
 async def stream(token: str, request: Request):
     url = unsign(token); headers = {"Range": request.headers["range"]} if request.headers.get("range") else {}
