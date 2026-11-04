@@ -44,12 +44,70 @@ async def lifespan(app: FastAPI):
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL environment variable is missing")
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    
+    # АВТОМИГРАЦИЯ: Создаем таблицы и добавляем колонку preview, если её нет
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS favorites (
+              user_id BIGINT NOT NULL,
+              track_id TEXT NOT NULL,
+              title TEXT NOT NULL,
+              artist TEXT,
+              duration TEXT,
+              cover TEXT,
+              source TEXT,
+              preview TEXT,
+              added_at TIMESTAMPTZ DEFAULT now(),
+              PRIMARY KEY (user_id, track_id)
+            );
+            ALTER TABLE favorites ADD COLUMN IF NOT EXISTS preview TEXT;
+            ALTER TABLE favorites ADD COLUMN IF NOT EXISTS cover TEXT;
+            ALTER TABLE favorites ADD COLUMN IF NOT EXISTS source TEXT;
+
+            CREATE TABLE IF NOT EXISTS library_tracks (
+              id BIGSERIAL PRIMARY KEY,
+              user_id BIGINT NOT NULL,
+              track_id TEXT NOT NULL,
+              title TEXT NOT NULL,
+              artist TEXT,
+              duration TEXT,
+              cover TEXT,
+              source TEXT,
+              preview TEXT,
+              added_at TIMESTAMPTZ DEFAULT now(),
+              UNIQUE (user_id, track_id)
+            );
+            ALTER TABLE library_tracks ADD COLUMN IF NOT EXISTS preview TEXT;
+
+            CREATE TABLE IF NOT EXISTS playlists (
+              id BIGSERIAL PRIMARY KEY,
+              user_id BIGINT NOT NULL,
+              title TEXT NOT NULL,
+              created_at TIMESTAMPTZ DEFAULT now()
+            );
+
+            CREATE TABLE IF NOT EXISTS playlist_tracks (
+              playlist_id BIGINT NOT NULL,
+              track_id TEXT NOT NULL,
+              title TEXT NOT NULL,
+              artist TEXT,
+              duration TEXT,
+              cover TEXT,
+              source TEXT,
+              preview TEXT,
+              position INT DEFAULT 0,
+              added_at TIMESTAMPTZ DEFAULT now(),
+              PRIMARY KEY (playlist_id, track_id)
+            );
+            ALTER TABLE playlist_tracks ADD COLUMN IF NOT EXISTS preview TEXT;
+        """)
+    
     _http = httpx.AsyncClient(
         timeout=httpx.Timeout(30.0, connect=10.0),
         follow_redirects=True,
         headers={"User-Agent": USER_AGENT, "Accept-Language": "ru-RU,ru;q=0.9"},
     )
-    print("[API] Connected to Neon DB")
+    print("[API] Connected to Neon DB, schema updated")
     try:
         yield
     finally:
@@ -105,7 +163,7 @@ class TrackData(BaseModel):
     duration: str = ""
     cover: str = ""
     source: str = ""
-    preview: str = "" # Добавлено для отправки в чат
+    preview: str = ""
 
 class PlaylistData(BaseModel):
     title: str
@@ -116,12 +174,12 @@ class PlaylistTrackData(TrackData):
 @app.get("/api/user_data")
 async def get_user_data(user_id: int = Depends(get_user_id)):
     async with pool.acquire() as conn:
-        favs = await conn.fetch("SELECT track_id AS id, title, artist, duration, cover, source FROM favorites WHERE user_id=$1", user_id)
-        lib = await conn.fetch("SELECT track_id AS id, title, artist, duration, cover, source FROM library_tracks WHERE user_id=$1", user_id)
+        favs = await conn.fetch("SELECT track_id AS id, title, artist, duration, cover, source, preview FROM favorites WHERE user_id=$1", user_id)
+        lib = await conn.fetch("SELECT track_id AS id, title, artist, duration, cover, source, preview FROM library_tracks WHERE user_id=$1", user_id)
         playlists = await conn.fetch("SELECT id, title AS name FROM playlists WHERE user_id=$1", user_id)
         pls = []
         for pl in playlists:
-            tracks = await conn.fetch("SELECT track_id AS id, title, artist, duration, cover, source FROM playlist_tracks WHERE playlist_id=$1 ORDER BY position", pl["id"])
+            tracks = await conn.fetch("SELECT track_id AS id, title, artist, duration, cover, source, preview FROM playlist_tracks WHERE playlist_id=$1 ORDER BY position", pl["id"])
             pls.append({"id": pl["id"], "name": pl["name"], "tracks": [dict(t) for t in tracks], "count": len(tracks)})
     return {"favorites": [dict(f) for f in favs], "library": [dict(l) for l in lib], "playlists": pls}
 
@@ -132,7 +190,7 @@ async def toggle_favorite(track: TrackData, user_id: int = Depends(get_user_id))
         if exists:
             await conn.execute("DELETE FROM favorites WHERE user_id=$1 AND track_id=$2", user_id, track.id)
             return {"status": "removed"}
-        await conn.execute("INSERT INTO favorites (user_id, track_id, title, artist, duration, cover, source) VALUES ($1,$2,$3,$4,$5,$6,$7)", user_id, track.id, track.title, track.artist, track.duration, track.cover, track.source)
+        await conn.execute("INSERT INTO favorites (user_id, track_id, title, artist, duration, cover, source, preview) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)", user_id, track.id, track.title, track.artist, track.duration, track.cover, track.source, track.preview)
         return {"status": "added"}
 
 @app.post("/api/playlists")
@@ -141,12 +199,20 @@ async def create_playlist(data: PlaylistData, user_id: int = Depends(get_user_id
         pl_id = await conn.fetchval("INSERT INTO playlists (user_id, title) VALUES ($1,$2) RETURNING id", user_id, data.title)
     return {"id": pl_id, "name": data.title, "tracks": [], "count": 0}
 
+@app.delete("/api/playlists/{playlist_id}")
+async def delete_playlist(playlist_id: int, user_id: int = Depends(get_user_id)):
+    async with pool.acquire() as conn:
+        owner = await conn.fetchval("SELECT user_id FROM playlists WHERE id=$1", playlist_id)
+        if owner != user_id: raise HTTPException(status_code=403, detail="Not your playlist")
+        await conn.execute("DELETE FROM playlists WHERE id=$1", playlist_id)
+    return {"status": "ok"}
+
 @app.post("/api/playlists/add_track")
 async def add_track_to_playlist(data: PlaylistTrackData, user_id: int = Depends(get_user_id)):
     async with pool.acquire() as conn:
         owner = await conn.fetchval("SELECT user_id FROM playlists WHERE id=$1", data.playlist_id)
         if owner != user_id: raise HTTPException(status_code=403, detail="Not your playlist")
-        await conn.execute("INSERT INTO playlist_tracks (playlist_id, track_id, title, artist, duration, cover, source) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING", data.playlist_id, data.id, data.title, data.artist, data.duration, data.cover, data.source)
+        await conn.execute("INSERT INTO playlist_tracks (playlist_id, track_id, title, artist, duration, cover, source, preview) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING", data.playlist_id, data.id, data.title, data.artist, data.duration, data.cover, data.source, data.preview)
     return {"status": "ok"}
 
 # ==========================================
@@ -157,14 +223,11 @@ async def send_to_chat(track: TrackData, user_id: int = Depends(get_user_id)):
     if not track.preview:
         raise HTTPException(status_code=400, detail="No preview URL")
     
-    # Формируем полный URL для аудио
     audio_url = track.preview
     if audio_url.startswith('/'):
-        # Здесь можно указать ваш домен на Render
         base_url = os.getenv("API_BASE_URL", "https://evumus.onrender.com")
         audio_url = base_url + audio_url
 
-    # Отправляем аудио через Telegram Bot API
     tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendAudio"
     payload = {
         "chat_id": user_id,
@@ -178,7 +241,6 @@ async def send_to_chat(track: TrackData, user_id: int = Depends(get_user_id)):
         async with httpx.AsyncClient() as client:
             res = await client.post(tg_url, json=payload, timeout=20.0)
             if res.status_code != 200:
-                # Если не удалось отправить как аудио (например, ссылка не подходит), шлем текстом
                 fallback_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
                 await client.post(fallback_url, json={
                     "chat_id": user_id,
