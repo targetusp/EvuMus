@@ -105,6 +105,7 @@ class TrackData(BaseModel):
     duration: str = ""
     cover: str = ""
     source: str = ""
+    preview: str = "" # Добавлено для отправки в чат
 
 class PlaylistData(BaseModel):
     title: str
@@ -146,6 +147,47 @@ async def add_track_to_playlist(data: PlaylistTrackData, user_id: int = Depends(
         owner = await conn.fetchval("SELECT user_id FROM playlists WHERE id=$1", data.playlist_id)
         if owner != user_id: raise HTTPException(status_code=403, detail="Not your playlist")
         await conn.execute("INSERT INTO playlist_tracks (playlist_id, track_id, title, artist, duration, cover, source) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING", data.playlist_id, data.id, data.title, data.artist, data.duration, data.cover, data.source)
+    return {"status": "ok"}
+
+# ==========================================
+# ОТПРАВКА В ЧАТ
+# ==========================================
+@app.post("/api/send_to_chat")
+async def send_to_chat(track: TrackData, user_id: int = Depends(get_user_id)):
+    if not track.preview:
+        raise HTTPException(status_code=400, detail="No preview URL")
+    
+    # Формируем полный URL для аудио
+    audio_url = track.preview
+    if audio_url.startswith('/'):
+        # Здесь можно указать ваш домен на Render
+        base_url = os.getenv("API_BASE_URL", "https://evumus.onrender.com")
+        audio_url = base_url + audio_url
+
+    # Отправляем аудио через Telegram Bot API
+    tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendAudio"
+    payload = {
+        "chat_id": user_id,
+        "audio": audio_url,
+        "title": track.title,
+        "performer": track.artist,
+        "caption": f"🎵 {track.title} — {track.artist}"
+    }
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.post(tg_url, json=payload, timeout=20.0)
+            if res.status_code != 200:
+                # Если не удалось отправить как аудио (например, ссылка не подходит), шлем текстом
+                fallback_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+                await client.post(fallback_url, json={
+                    "chat_id": user_id,
+                    "text": f"🎵 {track.title} — {track.artist}\n\nСлушать: {audio_url}"
+                })
+    except Exception as e:
+        print(f"[SEND ERROR] {e}")
+        raise HTTPException(status_code=500, detail="Failed to send message")
+        
     return {"status": "ok"}
 
 # ==========================================
@@ -344,47 +386,31 @@ async def yandex_search(query: str, limit: int) -> list:
     except Exception: return []
 
 # ==========================================
-# ЭНДПОИНТЫ ПОИСКА (С ТАЙМ-АУТОМ)
+# ЭНДПОИНТЫ ПОИСКА
 # ==========================================
 @app.get("/api/search")
 async def search(q: Optional[str] = Query(None), query: Optional[str] = Query(None), limit: int = Query(30, ge=1, le=100)):
     try:
         term = norm(q or query or "")
         if not term: return {"tracks": []}
-        
         tasks = []
-        # В Python 3.11+ asyncio.wait требует явного создания Task
-        if ENABLE_MUZOFOND: tasks.append(asyncio.create_task(muzofond_search(term, limit)))
-        if ENABLE_YANDEX: tasks.append(asyncio.create_task(yandex_search(term, limit)))
-        if ENABLE_SOUNDCLOUD: tasks.append(asyncio.create_task(soundcloud_search(term, limit)))
-        
-        if not tasks: return {"tracks": []}
-        
-        # Устанавливаем тайм-аут в 2.5 секунды
-        done, pending = await asyncio.wait(tasks, timeout=2.5)
-        
-        # Отменяем зависшие задачи
-        for task in pending:
-            task.cancel()
-            
+        if ENABLE_MUZOFOND: tasks.append(muzofond_search(term, limit))
+        if ENABLE_YANDEX: tasks.append(yandex_search(term, limit))
+        if ENABLE_SOUNDCLOUD: tasks.append(soundcloud_search(term, limit))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         merged, seen = [], set()
-        for task in done:
-            try:
-                res = task.result()
-                if not res: continue
-                for t in res:
-                    key = (str(t.get("artist") or "").lower(), str(t.get("title") or "").lower())
-                    if key in seen: continue
-                    seen.add(key); merged.append(t)
-            except Exception:
-                continue
+        for res in results:
+            if isinstance(res, Exception) or not res: continue
+            for t in res:
+                key = (str(t.get("artist") or "").lower(), str(t.get("title") or "").lower())
+                if key in seen: continue
+                seen.add(key); merged.append(t)
         
         merged = [t for t in merged if t.get("full") is not False and t.get("source") not in ("itunes", "deezer")]
         
         merged = rank(merged, term)[:limit]
         return {"tracks": [pack(t) for t in merged]}
-    except Exception: 
-        return {"tracks": []}
+    except Exception: return {"tracks": []}
 
 # ==========================================
 # АЛЬБОМЫ И ОБЛОЖКИ
