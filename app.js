@@ -3,7 +3,6 @@
 
   var API_URL = ''; 
 
-  // ===== РАЗБУДИТЬ СЕРВЕР ПРИ СТАРТЕ =====
   fetch(API_URL + '/api/health').catch(function(){});
 
   var pcInit = document.getElementById('playerContainer'); if (pcInit) pcInit.hidden = true;
@@ -152,6 +151,9 @@
     var page = $('#page-' + name); if (page) page.classList.add('active');
     $$('.nav__item[data-page]').forEach(function (b) { b.classList.toggle('active', b.getAttribute('data-page') === name); });
     var content = $('.content'); if(content) content.scrollTop = 0;
+    
+    // Перезапускаем обсервер для новой страницы
+    setTimeout(setupAnimations, 50);
   }
   $$('.nav__item[data-page]').forEach(function (btn) { btn.addEventListener('click', function () { goPage(btn.getAttribute('data-page')); }); });
   $$('[data-goto]').forEach(function (btn) { btn.addEventListener('click', function () { goPage(btn.getAttribute('data-goto')); }); });
@@ -178,7 +180,6 @@
     });
   }
 
-  // ИСПРАВЛЕНА ФУНКЦИЯ ВОССТАНОВЛЕНИЯ (Больше не меняет ID)
   async function restorePreview(tr) {
     if (tr.preview) return true;
     toast('Восстанавливаю ссылку...');
@@ -187,11 +188,9 @@
       var data = await res.json();
       if (data.tracks && data.tracks.length > 0) {
           var newTrack = data.tracks[0];
-          var oldId = tr.id; // СОХРАНЯЕМ СТАРЫЙ ID
+          var oldId = tr.id; 
           
-          tr.preview = newTrack.preview; 
-          tr.cover = newTrack.cover; 
-          tr.source = newTrack.source; 
+          tr.preview = newTrack.preview; tr.cover = newTrack.cover; tr.source = newTrack.source; 
           
           await fetch(API_URL + '/api/update_preview', {
               method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, getAuthHeader()),
@@ -202,7 +201,7 @@
           return true;
       }
     } catch (e) {}
-    toast('Не удалось найти превью для этого трека');
+    toast('Не удалось найти превью');
     return false;
   }
 
@@ -254,7 +253,9 @@
     var ownCover = trackCoverCache[(String(t.title || '') + '|' + String(t.artist || '')).toLowerCase()] || (t.cover ? absUrl(t.cover) : '') || coverFallback(t);
     t.cover = ownCover;
     var cover = '<img class="track__cover track__cover-image js-track-cover" data-title="' + esc(t.title || '') + '" data-artist="' + esc(t.artist || '') + '" src="' + ownCover + '" alt="" loading="lazy">';
-    return '<div class="track" data-id="' + esc(String(t.id)) + '">' + cover +
+    
+    // Добавляем класс animate-on-scroll
+    return '<div class="track animate-on-scroll" data-id="' + esc(String(t.id)) + '">' + cover +
       '<div class="track__meta"><div class="track__title">' + esc(t.title) + '</div><div class="track__artist">' + esc(t.artist) + (t.dur ? ' · ' + esc(t.dur) : '') + '</div></div>' +
       '<div class="track__actions">' +
       '<button class="track__btn js-play" title="Играть">' + playSvg() + '</button>' +
@@ -274,12 +275,38 @@
     preloadedAudios[url] = audio;
   }
 
+  // === НАСТРОЙКА АНИМАЦИЙ ===
+  var observer;
+  function setupAnimations() {
+    if (!('IntersectionObserver' in window)) {
+        document.querySelectorAll('.animate-on-scroll').forEach(function(el) { el.classList.add('is-visible'); });
+        return;
+    }
+    if (observer) observer.disconnect();
+    
+    observer = new IntersectionObserver(function(entries) {
+        entries.forEach(function(entry) {
+            if (entry.isIntersecting) {
+                entry.target.classList.add('is-visible');
+                observer.unobserve(entry.target);
+            }
+        });
+    }, { threshold: 0.1, rootMargin: "0px 0px -20px 0px" });
+
+    document.querySelectorAll('.animate-on-scroll').forEach(function(el) {
+        if (!el.classList.contains('is-visible')) observer.observe(el);
+    });
+  }
+
   function renderList(container, tracks) { 
     if (!container) return; 
     container.innerHTML = tracks.map(trackHTML).join(''); 
     hydrateTrackCovers(container); 
     updateRowPlayState(); 
     tracks.slice(0, 5).forEach(function(t) { if (t.preview) preloadAudio(t.preview); });
+    
+    // Запускаем анимацию
+    setTimeout(setupAnimations, 50);
   }
 
   // ===== Страницы =====
@@ -328,9 +355,10 @@
       if(empty) empty.hidden = true;
       if(results) {
         results.innerHTML = '<div class="search-album-grid">' + items.map(function(a) {
-          return '<button class="search-album-card" data-deezer-album="' + esc(a.id) + '"><img src="' + esc(absUrl(a.cover || '')) + '" alt="" loading="lazy"><span class="search-album-card__meta"><b>' + esc(a.title || 'Без названия') + '</b><small>' + esc(a.artist || 'Неизвестен') + '</small><small>' + esc(String(a.nb_tracks || 0)) + ' треков</small></span></button>';
+          return '<button class="search-album-card animate-on-scroll" data-deezer-album="' + esc(a.id) + '"><img src="' + esc(absUrl(a.cover || '')) + '" alt="" loading="lazy"><span class="search-album-card__meta"><b>' + esc(a.title || 'Без названия') + '</b><small>' + esc(a.artist || 'Неизвестен') + '</small><small>' + esc(String(a.nb_tracks || 0)) + ' треков</small></span></button>';
         }).join('') + '</div>';
         results.querySelectorAll('[data-deezer-album]').forEach(function(card) { card.addEventListener('click', function() { openAlbumTracks(card.getAttribute('data-deezer-album')); }); });
+        setTimeout(setupAnimations, 50);
       }
     }).catch(function() { if (requestId !== albumSearchRequestId) return; if(results) results.innerHTML = ''; if(empty) { empty.hidden = false; empty.innerHTML = '<p>Ошибка</p>'; } });
   }
@@ -421,10 +449,11 @@
     var grid = $('#playlistGrid'); if (!grid) return; 
     var html = '';
     playlists.forEach(function (p, idx) { 
-      html += '<div class="playlist-card" data-pl="' + idx + '"><button class="delete-btn js-del-pl" data-id="' + p.id + '" title="Удалить">🗑️</button><span class="playlist-card__plus">🎵</span><b>' + esc(p.name) + '</b><span>' + (p.count || 0) + ' треков</span></div>'; 
+      html += '<div class="playlist-card animate-on-scroll" data-pl="' + idx + '"><button class="delete-btn js-del-pl" data-id="' + p.id + '" title="Удалить">🗑️</button><span class="playlist-card__plus">🎵</span><b>' + esc(p.name) + '</b><span>' + (p.count || 0) + ' треков</span></div>'; 
     });
-    html += '<button class="playlist-card playlist-card--new" id="newPlaylistCard"><span class="playlist-card__plus">+</span><b>Новый плейлист</b><span>Добавить плейлист</span></button>'; 
+    html += '<button class="playlist-card playlist-card--new animate-on-scroll" id="newPlaylistCard"><span class="playlist-card__plus">+</span><b>Новый плейлист</b><span>Добавить плейлист</span></button>'; 
     grid.innerHTML = html;
+    
     var newPl = $('#newPlaylistCard'); if(newPl) newPl.addEventListener('click', openPlaylistModal);
     $$('.playlist-card[data-pl]').forEach(function (card) { 
       card.addEventListener('click', function (e) { if (e.target.closest('.js-del-pl')) return; openPlaylist(parseInt(card.getAttribute('data-pl'), 10)); }); 
@@ -437,6 +466,7 @@
         else toast('Ошибка');
       });
     });
+    setTimeout(setupAnimations, 50);
   }
 
   var plBack = $('#plBack'); if (plBack) plBack.addEventListener('click', function () { goPage('playlists'); });
@@ -457,8 +487,9 @@
   function renderAlbums() {
     var grid = $('#albumGrid'); if (!grid) return; var e = $('#albumEmpty'); if(e) e.hidden = albums.length > 0;
     grid.innerHTML = albums.map(function (a, idx) { 
-      return '<div class="playlist-card" data-album="' + idx + '"><button class="delete-btn js-del-album" data-idx="' + idx + '" title="Удалить">🗑️</button><span class="playlist-card__plus">💿</span><b>' + esc(a.name) + '</b><span>' + ((a.tracks || []).length) + ' треков</span></div>'; 
+      return '<div class="playlist-card animate-on-scroll" data-album="' + idx + '"><button class="delete-btn js-del-album" data-idx="' + idx + '" title="Удалить">🗑️</button><span class="playlist-card__plus">💿</span><b>' + esc(a.name) + '</b><span>' + ((a.tracks || []).length) + ' треков</span></div>'; 
     }).join('');
+    
     grid.querySelectorAll('[data-album]').forEach(function (card) { 
       card.addEventListener('click', function (e) { if (e.target.closest('.js-del-album')) return; openAlbum(parseInt(card.dataset.album, 10)); }); 
     });
@@ -468,6 +499,7 @@
         var idx = parseInt(this.getAttribute('data-idx'), 10); albums.splice(idx, 1); save(ALBUM_KEY, albums); renderAlbums(); toast('Удален');
       });
     });
+    setTimeout(setupAnimations, 50);
   }
   
   function openAlbum(idx) { if (!albums[idx]) return; activeAlbumIdx = idx; renderAlbumDetail(); goPage('alview'); }
@@ -531,7 +563,6 @@
     playerState.playing = on; var ip = $('#iconPlay'); if(ip) ip.toggleAttribute('hidden', on); var ipa = $('#iconPause'); if(ipa) ipa.toggleAttribute('hidden', !on); var pl = $('#player'); if(pl) pl.classList.toggle('is-playing', on); updateRowPlayState();
   }
   
-  // ОБНОВЛЕННАЯ ФУНКЦИЯ ПОДСВЕТКИ
   function updateRowPlayState() { 
     $$('.track').forEach(function (r) { 
       var b = r.querySelector('.track__btn.js-play'); 
