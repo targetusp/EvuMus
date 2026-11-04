@@ -62,6 +62,22 @@
     return parseInt(durStr, 10) || 0;
   }
 
+  // ===== Кастомное окно подтверждения =====
+  var confirmCb = null;
+  function showConfirm(text, cb) { 
+      var t = $('#confirmText'); if(t) t.textContent = text; 
+      var o = $('#confirmOverlay'); if(o) o.hidden = false; 
+      confirmCb = cb; 
+  }
+  var cCancel = $('#confirmCancel'); 
+  if (cCancel) cCancel.addEventListener('click', function () { var o = $('#confirmOverlay'); if(o) o.hidden = true; confirmCb = null; });
+  var cOk = $('#confirmOk'); 
+  if (cOk) cOk.addEventListener('click', function () { 
+      var o = $('#confirmOverlay'); if(o) o.hidden = true; 
+      if (confirmCb) confirmCb(); 
+      confirmCb = null; 
+  });
+
   // ===== API Запросы =====
   function getAuthHeader() { return (TG && TG.initData) ? { 'Authorization': TG.initData } : {}; }
 
@@ -98,15 +114,20 @@
     } catch (e) { toast('Ошибка'); }
   }
 
-  async function apiSendToChat(tr, btn) {
+  // ОТПРАВКА В ЧАТ (МГНОВЕННАЯ)
+  function apiSendToChat(tr, btn) {
     try {
-      var res = await fetch(API_URL + '/api/send_to_chat', {
-        method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, getAuthHeader()),
-        body: JSON.stringify({ id: String(tr.id), title: tr.title, artist: tr.artist, duration: tr.dur || '', cover: tr.cover || '', source: tr.source || '', preview: tr.preview || '' })
-      });
-      if (!res.ok) throw new Error();
-      toast('Трек отправлен в чат!');
-    } catch (e) { toast('Не удалось'); }
+        // Отправляем запрос, но не ждем ответа
+        fetch(API_URL + '/api/send_to_chat', {
+            method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, getAuthHeader()),
+            body: JSON.stringify({ id: String(tr.id), title: tr.title, artist: tr.artist, duration: tr.dur || '', cover: tr.cover || '', source: tr.source || '', preview: tr.preview || '' })
+        }).catch(function(){});
+        
+        // Сразу показываем уведомление
+        toast('Отправляю трек в чат...');
+    } catch (e) { 
+        toast('Не удалось'); 
+    }
   }
 
   async function apiDeletePlaylist(playlistId) {
@@ -477,7 +498,7 @@
     
     if (btn.classList.contains('js-play')) triggerPlay(row);
     else if (btn.classList.contains('js-fav')) { if (!tr) return; btn.disabled = true; apiToggleFav(tr, btn).then(function() { btn.disabled = false; }); }
-    else if (btn.classList.contains('js-send')) { if (!tr) return; btn.disabled = true; apiSendToChat(tr, btn).then(function() { btn.disabled = false; }); }
+    else if (btn.classList.contains('js-send')) { if (!tr) return; btn.disabled = true; apiSendToChat(tr, btn); setTimeout(function() { btn.disabled = false; }, 500); }
     else if (btn.classList.contains('js-addpl')) { if (!tr) return; openAddToPlaylist(id); }
   });
 
@@ -497,11 +518,19 @@
       card.addEventListener('click', function (e) { if (e.target.closest('.js-del-pl')) return; openPlaylist(parseInt(card.getAttribute('data-pl'), 10)); }); 
     });
     grid.querySelectorAll('.js-del-pl').forEach(function(btn) {
-      btn.addEventListener('click', async function(e) {
-        e.stopPropagation(); if (!confirm('Удалить плейлист?')) return;
-        var plId = this.getAttribute('data-id'); var success = await apiDeletePlaylist(plId);
-        if (success) { playlists = playlists.filter(function(p) { return p.id != plId; }); renderPlaylists(); toast('Удален'); }
-        else toast('Ошибка');
+      btn.addEventListener('click', function(e) {
+        e.stopPropagation(); 
+        showConfirm('Удалить этот плейлист?', async function() {
+            var plId = btn.getAttribute('data-id');
+            var success = await apiDeletePlaylist(plId);
+            if (success) { 
+                playlists = playlists.filter(function(p) { return p.id != plId; }); 
+                renderPlaylists(); 
+                toast('Плейлист удален'); 
+            } else { 
+                toast('Ошибка удаления'); 
+            }
+        });
       });
     });
     setTimeout(setupAnimations, 50);
@@ -533,8 +562,14 @@
     });
     grid.querySelectorAll('.js-del-album').forEach(function(btn) {
       btn.addEventListener('click', function(e) {
-        e.stopPropagation(); if (!confirm('Удалить альбом?')) return;
-        var idx = parseInt(this.getAttribute('data-idx'), 10); albums.splice(idx, 1); save(ALBUM_KEY, albums); renderAlbums(); toast('Удален');
+        e.stopPropagation(); 
+        showConfirm('Удалить этот альбом?', function() {
+            var idx = parseInt(btn.getAttribute('data-idx'), 10);
+            albums.splice(idx, 1);
+            save(ALBUM_KEY, albums);
+            renderAlbums();
+            toast('Альбом удален');
+        });
       });
     });
     setTimeout(setupAnimations, 50);
@@ -560,11 +595,14 @@
   $$('.theme-option').forEach(function (b) { b.addEventListener('click', function () { applyTheme(b.getAttribute('data-theme-pick')); toast('Тема: ' + THEME_NAMES[b.getAttribute('data-theme-pick')]); }); });
   var btnFeed = $('#btnFeedback'); if (btnFeed) btnFeed.addEventListener('click', function () { window.open('https://t.me/EvuMusic', '_blank'); });
   
-  var confirmCb = null;
-  function showConfirm(text, cb) { var t = $('#confirmText'); if(t) t.textContent = text; var o = $('#confirmOverlay'); if(o) o.hidden = false; confirmCb = cb; }
-  var cCancel = $('#confirmCancel'); if (cCancel) cCancel.addEventListener('click', function () { var o = $('#confirmOverlay'); if(o) o.hidden = true; confirmCb = null; });
-  var cOk = $('#confirmOk'); if (cOk) cOk.addEventListener('click', function () { var o = $('#confirmOverlay'); if(o) o.hidden = true; if (confirmCb) confirmCb(); confirmCb = null; });
-  var btnDel = $('#btnDelete'); if (btnDel) btnDel.addEventListener('click', function () { showConfirm('Удалить кабинет?', function () { library = []; favs = []; playlists = []; albums = []; save(ALBUM_KEY, albums); refreshAll(); renderPlaylists(); renderAlbums(); toast('Удалено'); }); });
+  var btnDel = $('#btnDelete'); if (btnDel) btnDel.addEventListener('click', function () { 
+      showConfirm('Удалить кабинет?', function () { 
+          library = []; favs = []; playlists = []; albums = []; 
+          save(ALBUM_KEY, albums); 
+          refreshAll(); renderPlaylists(); renderAlbums(); 
+          toast('Удалено'); 
+      }); 
+  });
 
   // ===== Плеер =====
   var previewAudio = null; var previewTrackId = null; var playerState = { playing: false };
@@ -630,7 +668,6 @@
       if (!b) return; 
       var cur = !!(onPlaying() && previewTrackId && r.getAttribute('data-id') === previewTrackId); 
       r.classList.toggle('is-current', cur); 
-      // Если трек загружается - лоадер, иначе play/pause
       if (cur) {
           if (b.innerHTML !== loaderSvg()) b.innerHTML = pauseSvg();
       } else {
