@@ -9,29 +9,25 @@ from contextlib import asynccontextmanager
 import asyncpg
 from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Глобальный пул соединений
 pool: Optional[asyncpg.Pool] = None
 
-# Современный способ управления жизненным циклом приложения (вместо on_event)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global pool
-    # Подключаемся к Neon при старте
     pool = await asyncpg.create_pool(os.getenv("DATABASE_URL"), min_size=1, max_size=10)
     print("Connected to Neon DB")
     yield
-    # Закрываем пул при остановке
     if pool:
         await pool.close()
 
-app = FastAPI(title="EvuMusic User Data API", lifespan=lifespan)
+app = FastAPI(title="EvuMusic API", lifespan=lifespan)
 
-# Разрешаем запросы с любых доменов (чтобы Render и локальный тест работали)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -41,7 +37,6 @@ app.add_middleware(
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# Модели данных для приема запросов от сайта
 class TrackData(BaseModel):
     id: str
     title: str
@@ -56,18 +51,13 @@ class PlaylistData(BaseModel):
 class PlaylistTrackData(TrackData):
     playlist_id: int
 
-# Функция проверки подписи Telegram (чтобы хакеры не могли слать левые запросы)
 def verify_telegram_data(init_data: str) -> dict:
     if not init_data:
         raise HTTPException(status_code=401, detail="No init data")
     try:
         parsed_data = dict(parse_qsl(init_data))
         hash_str = parsed_data.pop('hash')
-        
-        # Собираем строку для проверки
         data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed_data.items()))
-        
-        # Вычисляем хэш на основе BOT_TOKEN
         secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
         calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
         
@@ -77,24 +67,18 @@ def verify_telegram_data(init_data: str) -> dict:
     except Exception as e:
         raise HTTPException(status_code=403, detail=str(e))
 
-# Зависимость: вытаскиваем ID пользователя из заголовка Authorization
 async def get_user_id(authorization: str = Header(None)):
     user = verify_telegram_data(authorization)
     return user['id']
 
+# --- API ЭНДПОИНТЫ ---
 
-# --- ЭНДПОИНТЫ (API) ---
-
-# 1. Получить ВСЕ данные пользователя при загрузке приложения
 @app.get("/api/user_data")
 async def get_user_data(user_id: int = Depends(get_user_id)):
     async with pool.acquire() as conn:
-        # Любимые треки
         favs = await conn.fetch("SELECT track_id as id, title, artist, duration, cover, source FROM favorites WHERE user_id=$1", user_id)
-        # Коллекция
         lib = await conn.fetch("SELECT track_id as id, title, artist, duration, cover, source FROM library_tracks WHERE user_id=$1", user_id)
         
-        # Плейлисты
         playlists = await conn.fetch("SELECT id, title as name FROM playlists WHERE user_id=$1", user_id)
         pls = []
         for pl in playlists:
@@ -105,14 +89,8 @@ async def get_user_data(user_id: int = Depends(get_user_id)):
                 "tracks": [dict(t) for t in tracks],
                 "count": len(tracks)
             })
-            
-    return {
-        "favorites": [dict(f) for f in favs],
-        "library": [dict(l) for l in lib],
-        "playlists": pls
-    }
+    return {"favorites": [dict(f) for f in favs], "library": [dict(l) for l in lib], "playlists": pls}
 
-# 2. Добавить/удалить из Любимого
 @app.post("/api/favorites")
 async def toggle_favorite(track: TrackData, user_id: int = Depends(get_user_id)):
     async with pool.acquire() as conn:
@@ -127,7 +105,6 @@ async def toggle_favorite(track: TrackData, user_id: int = Depends(get_user_id))
             )
             return {"status": "added"}
 
-# 3. Добавить/удалить из Коллекции (Моя музыка)
 @app.post("/api/library")
 async def toggle_library(track: TrackData, user_id: int = Depends(get_user_id)):
     async with pool.acquire() as conn:
@@ -142,7 +119,6 @@ async def toggle_library(track: TrackData, user_id: int = Depends(get_user_id)):
             )
             return {"status": "added"}
 
-# 4. Создать плейлист
 @app.post("/api/playlists")
 async def create_playlist(data: PlaylistData, user_id: int = Depends(get_user_id)):
     async with pool.acquire() as conn:
@@ -152,18 +128,18 @@ async def create_playlist(data: PlaylistData, user_id: int = Depends(get_user_id
         )
         return {"id": pl_id, "name": data.title, "tracks": [], "count": 0}
 
-# 5. Добавить трек в плейлист
 @app.post("/api/playlists/add_track")
 async def add_track_to_playlist(data: PlaylistTrackData, user_id: int = Depends(get_user_id)):
     async with pool.acquire() as conn:
-        # Проверяем, что плейлист принадлежит этому юзеру
         owner = await conn.fetchval("SELECT user_id FROM playlists WHERE id=$1", data.playlist_id)
         if owner != user_id:
             raise HTTPException(status_code=403, detail="Not your playlist")
-            
         await conn.execute(
             """INSERT INTO playlist_tracks (playlist_id, track_id, title, artist, duration, cover, source) 
                VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING""",
             data.playlist_id, data.id, data.title, data.artist, data.duration, data.cover, data.source
         )
         return {"status": "ok"}
+
+# --- РАЗДАЧА САЙТА (Должно быть в самом низу!) ---
+app.mount("/", StaticFiles(directory=".", html=True), name="static")
