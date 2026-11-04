@@ -38,7 +38,6 @@
   var theme = load(THEME_KEY, 'blue');
   if (!Array.isArray(albums)) albums = [];
 
-  // ИЗМЕНЕНО: Дефолтная вкладка теперь 'fav' (Любимое)
   var mymusicTab = 'fav';
   var searchTab = 'tracks';
 
@@ -69,7 +68,7 @@
     } catch (e) { console.error(e); }
   }
 
-  async function apiToggleFav(tr) {
+  async function apiToggleFav(tr, btn) {
     try {
       var res = await fetch(API_URL + '/api/favorites', {
         method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, getAuthHeader()),
@@ -77,13 +76,30 @@
       });
       if (!res.ok) throw new Error();
       var data = await res.json();
-      if (data.status === 'added') { favs.push(tr); toast('Добавлено в любимое'); } 
-      else { favs = favs.filter(function(f) { return String(f.id) !== String(tr.id); }); toast('Убрано из любимого'); }
-      refreshAll();
+      var isAdded = data.status === 'added';
+
+      if (isAdded) { 
+        favs.push(tr); 
+        toast('Добавлено в любимое'); 
+      } else { 
+        favs = favs.filter(function(f) { return String(f.id) !== String(tr.id); }); 
+        toast('Убрано из любимого'); 
+      }
+
+      // Мгновенно обновляем кнопку (без перезагрузки поиска)
+      if (btn) {
+        btn.classList.toggle('active', isAdded);
+        btn.innerHTML = isAdded 
+          ? '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 20.5s-7.5-4.7-7.5-10A4.2 4.2 0 0 1 12 7.5a4.2 4.2 0 0 1 7.5 3c0 5.3-7.5 10-7.5 10z"/></svg>'
+          : '<svg viewBox="0 0 24 24" fill="none"><path d="M12 20.5s-7.5-4.7-7.5-10A4.2 4.2 0 0 1 12 7.5a4.2 4.2 0 0 1 7.5 3c0 5.3-7.5 10-7.5 10z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>';
+      }
+
+      // Обновляем только список "Моя музыка" в фоне
+      refreshAll(); 
     } catch (e) { toast('Ошибка сохранения'); }
   }
 
-  async function apiSendToChat(tr) {
+  async function apiSendToChat(tr, btn) {
     try {
       var res = await fetch(API_URL + '/api/send_to_chat', {
         method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, getAuthHeader()),
@@ -354,12 +370,20 @@
     var btn = e.target.closest('.track__btn'); if (!btn) return; var row = btn.closest('.track'); var id = row.getAttribute('data-id'); var tr = findTrack(id);
     
     if (btn.classList.contains('js-play')) triggerPlay(row);
-    else if (btn.classList.contains('js-fav')) { if (!tr) return; btn.disabled = true; apiToggleFav(tr).then(function() { btn.disabled = false; }); }
-    else if (btn.classList.contains('js-send')) { if (!tr) return; btn.disabled = true; apiSendToChat(tr).then(function() { btn.disabled = false; }); }
+    else if (btn.classList.contains('js-fav')) { 
+      if (!tr) return; 
+      btn.disabled = true; 
+      // Передаем btn, чтобы обновить только иконку
+      apiToggleFav(tr, btn).then(function() { btn.disabled = false; }); 
+    }
+    else if (btn.classList.contains('js-send')) { if (!tr) return; btn.disabled = true; apiSendToChat(tr, btn).then(function() { btn.disabled = false; }); }
     else if (btn.classList.contains('js-addpl')) { if (!tr) return; openAddToPlaylist(id); }
   });
 
-  function refreshAll() { renderMyMusic(); renderSearch(); }
+  // Обновляет только Мою музыку (без перерисовки поиска)
+  function refreshAll() { 
+    renderMyMusic(); 
+  }
 
   function renderPlaylists() {
     var grid = $('#playlistGrid'); if (!grid) return; var html = '';
