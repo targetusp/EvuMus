@@ -185,7 +185,7 @@
       return (d.tracks || []).map(function (t) {
         var dur = t.dur || (t.duration ? Math.floor(t.duration / 60) + ':' + ('0' + (t.duration % 60)).slice(-2) : '');
         return { id: String(t.id), title: t.title, artist: t.artist || '', dur: dur, cover: absUrl(t.cover || ''), preview: absUrl(t.preview_url || t.preview || t.stream_url || ''), full: t.full !== false, source: t.source || 'ru' };
-      }).filter(function (t) { return !!t.preview && t.full !== false; }); // ЖЕСТКИЙ ФИЛЬТР: только полные треки
+      }).filter(function (t) { return !!t.preview && t.full !== false; });
     });
   }
 
@@ -220,22 +220,19 @@
       if (coverRequests[key]) return;
       coverRequests[key] = true;
       
-      // Запрос на бэкенд для получения картинки (через iTunes/Deezer)
       fetch(API_URL + '/api/track-cover?title=' + encodeURIComponent(title) + '&artist=' + encodeURIComponent(artist || '')).then(function(r) { return r.json(); }).then(function(d) {
         if (!d || !d.cover) return;
         var image = d.cover;
         trackCoverCache[key] = image; try { save('evu_track_cover_cache_v6', trackCoverCache); } catch(e) {}
         
-        // Обновляем картинку в списке
         document.querySelectorAll('.js-track-cover[data-title]').forEach(function(el) {
           if (((el.getAttribute('data-title') || '') + '|' + (el.getAttribute('data-artist') || '')).toLowerCase() === key) el.src = image;
         });
 
-        // ОБНОВЛЯЕМ КАРТИНКУ В ПЛЕЕРЕ, ЕСЛИ ЭТОТ ТРЕК СЕЙЧАС ИГРАЕТ
         if (previewTrackId) {
             var playingTrack = trackRegistry[previewTrackId];
             if (playingTrack && ((playingTrack.title || '') + '|' + (playingTrack.artist || '')).toLowerCase() === key) {
-                playingTrack.cover = image; // Сохраняем в реестр
+                playingTrack.cover = image;
                 var pc = document.getElementById('playerCover');
                 if (pc) { pc.innerHTML = '<img src="' + esc(image) + '" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:50%">'; pc.style.background = 'none'; }
             }
@@ -458,11 +455,14 @@
   function onPlaying() { return !!playerState.playing; }
   
   function showPlayer(t) {
-    var pl = $('#player'); if(pl) pl.hidden = false; var pt = $('#playerTitle'); if(pt) pt.textContent = t.title; var pa = $('#playerArtist'); if(pa) pa.textContent = t.artist; var c = $('#playerCover');
+    var pc = $('#playerContainer'); if(pc) pc.hidden = false;
+    var pl = $('#player'); if(pl) pl.hidden = false; 
+    var pt = $('#playerTitle'); if(pt) pt.textContent = t.title; 
+    var pa = $('#playerArtist'); if(pa) pa.textContent = t.artist; 
+    var c = $('#playerCover');
     if (c) { 
         var key = ((t.title || '') + '|' + (t.artist || '')).toLowerCase();
         var art = trackCoverCache[key] || t.cover || ''; 
-        // ВНЕДРЕН КРУГЛЫЙ ДИЗАЙН ДЛЯ ОБЛОЖКИ В ПЛЕЕРЕ
         if (art) { c.innerHTML = '<img src="' + esc(art) + '" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:50%">'; c.style.background = 'none'; } 
         else { c.innerHTML = ''; c.style.background = coverColor(String(t.id).length + (t.title || '').length); c.textContent = coverLetter(t.title); } 
     }
@@ -491,7 +491,7 @@
   applyVolume(volume);
   var vSlider = $('#playerVolume'); if (vSlider) vSlider.addEventListener('input', function () { volume = parseInt(this.value, 10); if (volume > 0) lastVolume = volume; applyVolume(volume); });
   var muteBtn = $('#playerMute'); if (muteBtn) muteBtn.addEventListener('click', function () { if (volume > 0) { lastVolume = volume; volume = 0; } else { volume = lastVolume || 100; } applyVolume(volume); });
-  var closeBtn = $('#playerClose'); if (closeBtn) closeBtn.addEventListener('click', function () { stopPreview(); playerState.playing = false; var pl = $('#player'); if(pl) pl.hidden = true; var pr = $('#playerProgress'); if(pr) pr.style.width = '0%'; });
+  var closeBtn = $('#playerClose'); if (closeBtn) closeBtn.addEventListener('click', function () { stopPreview(); playerState.playing = false; var pc = $('#playerContainer'); if(pc) pc.hidden = true; var pl = $('#player'); if(pl) pl.hidden = true; var pr = $('#playerProgress'); if(pr) pr.style.width = '0%'; });
 
   // ===== Init =====
   renderPlaylists(); renderAlbums(); loadUserData(); favTitle();
