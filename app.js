@@ -55,7 +55,6 @@
   function coverLetter(t) { return (t || '?').charAt(0).toUpperCase(); }
   function toast(msg) { var el = $('#toast'); if(!el) return; el.textContent = msg; el.hidden = false; clearTimeout(el._t); el._t = setTimeout(function () { el.hidden = true; }, 2200); }
 
-  // Парсим строку "3:45" в секунды (225)
   function parseDuration(durStr) {
     if (!durStr) return 0;
     var parts = durStr.split(':');
@@ -243,6 +242,7 @@
   function isFav(id) { return favs.some(function(f) { return String(f.id) === String(id); }); }
   function playSvg() { return '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5l12 7-12 7V5z"/></svg>'; }
   function pauseSvg() { return '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z"/></svg>'; }
+  function loaderSvg() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="animation: spin 1s linear infinite"><circle cx="12" cy="12" r="10" stroke-opacity="0.25"/><path d="M12 2a10 10 0 0 1 10 10" stroke-linecap="round"/></svg>'; }
 
   function coverFallback(t) {
     var title = String((t && t.title) || 'Без названия').slice(0, 48); var artist = String((t && t.artist) || 'EvuMusic').slice(0, 42);
@@ -401,7 +401,7 @@
         registerTrack(track); return track;
       });
       if(results) {
-        results.innerHTML = '<div class="album-search-detail"><button class="btn-back" id="albumTracksBack">← Назад</button><div class="album-search-heading"><img src="' + esc(absUrl(data.album.cover || '')) + '" alt=""><div><h3>' + esc(data.album.title || 'Альбом') + '</h3><p>' + esc(data.album.artist || '') + '</p></div></div><div class="track-list" id="albumTracksList"></div></div>';
+        results.innerHTML = '<div class="album-search-detail"><button class="btn-back" id="albumTracksBack">←</button><div class="album-search-heading"><img src="' + esc(absUrl(data.album.cover || '')) + '" alt=""><div><h3>' + esc(data.album.title || 'Альбом') + '</h3><p>' + esc(data.album.artist || '') + '</p></div></div><div class="track-list" id="albumTracksList"></div></div>';
         var db = $('#albumTracksBack'); if(db) db.addEventListener('click', function() { renderAlbumSearch(($('#searchInput').value || '').trim()); });
         renderList($('#albumTracksList'), tracks);
       }
@@ -454,11 +454,20 @@
   
   async function triggerPlay(row) {
     if (!row) return; var id = row.getAttribute('data-id'); var tr = findTrack(id); if (!tr) return;
+    var playBtn = row.querySelector('.js-play');
+    
     if (!tr.preview) {
+        if (playBtn) playBtn.innerHTML = loaderSvg();
         var restored = await restorePreview(tr, false);
-        if (!restored) return;
+        if (!restored) {
+            if (playBtn) playBtn.innerHTML = playSvg();
+            return;
+        }
     }
-    queueIds = []; row.parentElement.querySelectorAll('.track').forEach(function (r) { queueIds.push(r.getAttribute('data-id')); }); playPreview(tr);
+    
+    if (playBtn) playBtn.innerHTML = loaderSvg();
+    queueIds = []; row.parentElement.querySelectorAll('.track').forEach(function (r) { queueIds.push(r.getAttribute('data-id')); }); 
+    playPreview(tr);
   }
 
   var contentEl = document.getElementById('content');
@@ -577,7 +586,14 @@
     var playPromise = previewAudio.play(); if (playPromise && playPromise.catch) playPromise.catch(function () {});
     showPlayer(t); setPlayingUI(true);
     
-    // ИСПРАВЛЕНО: Берем длительность из метаданных, если аудио не может определить
+    previewAudio.onwaiting = function() {
+        var activeRow = document.querySelector('.track[data-id="' + previewTrackId + '"]');
+        if(activeRow) { var b = activeRow.querySelector('.js-play'); if(b) b.innerHTML = loaderSvg(); }
+    };
+    previewAudio.onplaying = function() {
+        setPlayingUI(true);
+    };
+
     previewAudio.ontimeupdate = function () { 
       if (previewAudio && !seekDrag) { 
         var dur = previewAudio.duration;
@@ -599,8 +615,13 @@
     if (trackCoverCache[key]) t.cover = trackCoverCache[key];
     startAudio(t.preview, t); showPlayer(t); setPlayingUI(true);
   }
+  
   function setPlayingUI(on) {
-    playerState.playing = on; var ip = $('#iconPlay'); if(ip) ip.toggleAttribute('hidden', on); var ipa = $('#iconPause'); if(ipa) ipa.toggleAttribute('hidden', !on); var pl = $('#player'); if(pl) pl.classList.toggle('is-playing', on); updateRowPlayState();
+    playerState.playing = on; 
+    var ip = $('#iconPlay'); if(ip) ip.toggleAttribute('hidden', on); 
+    var ipa = $('#iconPause'); if(ipa) ipa.toggleAttribute('hidden', !on); 
+    var pl = $('#player'); if(pl) pl.classList.toggle('is-playing', on); 
+    updateRowPlayState();
   }
   
   function updateRowPlayState() { 
@@ -609,7 +630,12 @@
       if (!b) return; 
       var cur = !!(onPlaying() && previewTrackId && r.getAttribute('data-id') === previewTrackId); 
       r.classList.toggle('is-current', cur); 
-      b.innerHTML = cur ? pauseSvg() : playSvg(); 
+      // Если трек загружается - лоадер, иначе play/pause
+      if (cur) {
+          if (b.innerHTML !== loaderSvg()) b.innerHTML = pauseSvg();
+      } else {
+          b.innerHTML = playSvg();
+      }
     }); 
   }
   
@@ -644,7 +670,6 @@
     if (previewAudio) {
         var tr = findTrack(previewTrackId);
         var dur = previewAudio.duration;
-        // Если длительность сломана - берем из метаданных
         if (!dur || !isFinite(dur) || dur === 0 || dur === 30) {
             dur = (tr ? parseDuration(tr.dur) : 0) || 30;
         }
