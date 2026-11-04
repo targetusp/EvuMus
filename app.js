@@ -72,7 +72,7 @@
     try {
       var res = await fetch(API_URL + '/api/favorites', {
         method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, getAuthHeader()),
-        body: JSON.stringify({ id: String(tr.id), title: tr.title, artist: tr.artist, duration: tr.dur || '', cover: tr.cover || '', source: tr.source || '' })
+        body: JSON.stringify({ id: String(tr.id), title: tr.title, artist: tr.artist, duration: tr.dur || '', cover: tr.cover || '', source: tr.source || '', preview: tr.preview || '' })
       });
       if (!res.ok) throw new Error();
       var data = await res.json();
@@ -86,7 +86,6 @@
         toast('Убрано из любимого'); 
       }
 
-      // Мгновенно обновляем кнопку (без перезагрузки поиска)
       if (btn) {
         btn.classList.toggle('active', isAdded);
         btn.innerHTML = isAdded 
@@ -94,7 +93,6 @@
           : '<svg viewBox="0 0 24 24" fill="none"><path d="M12 20.5s-7.5-4.7-7.5-10A4.2 4.2 0 0 1 12 7.5a4.2 4.2 0 0 1 7.5 3c0 5.3-7.5 10-7.5 10z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>';
       }
 
-      // Обновляем только список "Моя музыка" в фоне
       refreshAll(); 
     } catch (e) { toast('Ошибка сохранения'); }
   }
@@ -112,6 +110,15 @@
     }
   }
 
+  async function apiDeletePlaylist(playlistId) {
+    try {
+      var res = await fetch(API_URL + '/api/playlists/' + playlistId, {
+        method: 'DELETE', headers: getAuthHeader()
+      });
+      return res.ok;
+    } catch (e) { return false; }
+  }
+
   async function apiCreatePlaylist(name) {
     try {
       var res = await fetch(API_URL + '/api/playlists', {
@@ -127,7 +134,7 @@
     try {
       var res = await fetch(API_URL + '/api/playlists/add_track', {
         method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, getAuthHeader()),
-        body: JSON.stringify({ playlist_id: playlistId, id: String(tr.id), title: tr.title, artist: tr.artist, duration: tr.dur || '', cover: tr.cover || '', source: tr.source || '' })
+        body: JSON.stringify({ playlist_id: playlistId, id: String(tr.id), title: tr.title, artist: tr.artist, duration: tr.dur || '', cover: tr.cover || '', source: tr.source || '', preview: tr.preview || '' })
       });
       return res.ok;
     } catch (e) { return false; }
@@ -178,6 +185,34 @@
         return { id: String(t.id), title: t.title, artist: t.artist || '', dur: dur, cover: absUrl(t.cover || ''), preview: absUrl(t.preview_url || t.preview || t.stream_url || ''), full: t.full !== false, source: t.source || 'ru' };
       }).filter(function (t) { return !!t.preview && t.full !== false; });
     });
+  }
+
+  // ВОССТАНОВЛЕНИЕ ПРЕВЬЮ
+  async function restorePreview(tr) {
+    if (tr.preview) return true;
+    toast('Восстанавливаю ссылку...');
+    try {
+      var res = await fetch(API_URL + '/api/search?q=' + encodeURIComponent((tr.artist || '') + ' ' + tr.title));
+      var data = await res.json();
+      if (data.tracks && data.tracks.length > 0) {
+          var newTrack = data.tracks[0];
+          tr.preview = newTrack.preview;
+          tr.cover = newTrack.cover;
+          tr.source = newTrack.source;
+          tr.id = newTrack.id; // Обновляем ID на актуальный
+          
+          await fetch(API_URL + '/api/update_preview', {
+              method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, getAuthHeader()),
+              body: JSON.stringify({ id: String(tr.id), title: tr.title, artist: tr.artist, preview: tr.preview })
+          });
+          
+          // Обновляем в локальных массивах
+          trackRegistry[tr.id] = tr;
+          return true;
+      }
+    } catch (e) {}
+    toast('Не удалось найти превью для этого трека');
+    return false;
   }
 
   // ===== Отрисовка =====
@@ -358,14 +393,21 @@
 
   // ===== Действия =====
   function findTrack(id) { return trackRegistry[id] || favs.find(function (f) { return String(f.id) === String(id); }) || library.find(function (l) { return String(l.id) === String(id); }); }
-  function triggerPlay(row) {
+  
+  async function triggerPlay(row) {
     if (!row) return; var id = row.getAttribute('data-id'); var tr = findTrack(id); if (!tr) return;
-    if (!tr.preview) { toast('Нет превью'); return; }
+    
+    // ПЫТАЕМСЯ ВОССТАНОВИТЬ ПРЕВЬЮ, ЕСЛИ ЕГО НЕТ
+    if (!tr.preview) {
+        var restored = await restorePreview(tr);
+        if (!restored) return;
+    }
+
     queueIds = []; row.parentElement.querySelectorAll('.track').forEach(function (r) { queueIds.push(r.getAttribute('data-id')); }); playPreview(tr);
   }
 
   var contentEl = document.getElementById('content');
-  if (contentEl) contentEl.addEventListener('click', function (e) {
+  if (contentEl) contentEl.addEventListener('click', async function (e) {
     var coverEl = e.target.closest('.track__cover'); if (coverEl) { triggerPlay(coverEl.closest('.track')); return; }
     var btn = e.target.closest('.track__btn'); if (!btn) return; var row = btn.closest('.track'); var id = row.getAttribute('data-id'); var tr = findTrack(id);
     
@@ -373,25 +415,51 @@
     else if (btn.classList.contains('js-fav')) { 
       if (!tr) return; 
       btn.disabled = true; 
-      // Передаем btn, чтобы обновить только иконку
       apiToggleFav(tr, btn).then(function() { btn.disabled = false; }); 
     }
     else if (btn.classList.contains('js-send')) { if (!tr) return; btn.disabled = true; apiSendToChat(tr, btn).then(function() { btn.disabled = false; }); }
     else if (btn.classList.contains('js-addpl')) { if (!tr) return; openAddToPlaylist(id); }
   });
 
-  // Обновляет только Мою музыку (без перерисовки поиска)
-  function refreshAll() { 
-    renderMyMusic(); 
+  function refreshAll() { renderMyMusic(); }
+
+  // ОБНОВЛЕНО: Рендер плейлистов с кнопкой удаления
+  function renderPlaylists() {
+    var grid = $('#playlistGrid'); if (!grid) return; 
+    var html = '';
+    playlists.forEach(function (p, idx) { 
+      html += '<div class="playlist-card" data-pl="' + idx + '">' +
+              '<button class="delete-btn js-del-pl" data-id="' + p.id + '" title="Удалить">🗑️</button>' +
+              '<span class="playlist-card__plus">🎵</span><b>' + esc(p.name) + '</b><span>' + (p.count || 0) + ' треков</span></div>'; 
+    });
+    html += '<button class="playlist-card playlist-card--new" id="newPlaylistCard"><span class="playlist-card__plus">+</span><b>Новый плейлист</b><span>Добавить плейлист</span></button>'; 
+    grid.innerHTML = html;
+    
+    var newPl = $('#newPlaylistCard'); if(newPl) newPl.addEventListener('click', openPlaylistModal);
+    $$('.playlist-card[data-pl]').forEach(function (card) { 
+      card.addEventListener('click', function (e) { 
+        if (e.target.closest('.js-del-pl')) return; 
+        openPlaylist(parseInt(card.getAttribute('data-pl'), 10)); 
+      }); 
+    });
+
+    grid.querySelectorAll('.js-del-pl').forEach(function(btn) {
+      btn.addEventListener('click', async function(e) {
+        e.stopPropagation();
+        if (!confirm('Удалить этот плейлист?')) return;
+        var plId = this.getAttribute('data-id');
+        var success = await apiDeletePlaylist(plId);
+        if (success) {
+          playlists = playlists.filter(function(p) { return p.id != plId; });
+          renderPlaylists();
+          toast('Плейлист удален');
+        } else {
+          toast('Ошибка удаления');
+        }
+      });
+    });
   }
 
-  function renderPlaylists() {
-    var grid = $('#playlistGrid'); if (!grid) return; var html = '';
-    playlists.forEach(function (p, idx) { html += '<div class="playlist-card" data-pl="' + idx + '"><span class="playlist-card__plus">🎵</span><b>' + esc(p.name) + '</b><span>' + (p.count || 0) + ' треков</span></div>'; });
-    html += '<button class="playlist-card playlist-card--new" id="newPlaylistCard"><span class="playlist-card__plus">+</span><b>Новый плейлист</b><span>Добавить плейлист</span></button>'; grid.innerHTML = html;
-    var newPl = $('#newPlaylistCard'); if(newPl) newPl.addEventListener('click', openPlaylistModal);
-    $$('.playlist-card[data-pl]').forEach(function (card) { card.addEventListener('click', function () { openPlaylist(parseInt(card.getAttribute('data-pl'), 10)); }); });
-  }
   var plBack = $('#plBack'); if (plBack) plBack.addEventListener('click', function () { goPage('playlists'); });
   function openPlaylist(idx) { if (!playlists[idx]) { goPage('playlists'); return; } activePlIdx = idx; renderPlaylistDetail(); goPage('plview'); }
   function renderPlaylistDetail() { var pl = playlists[activePlIdx]; if (!pl) return; var t = $('#plViewTitle'); if(t) t.textContent = pl.name; var tracks = (pl.tracks || []).filter(Boolean); var e = $('#plViewEmpty'); if(e) e.hidden = tracks.length > 0; renderList($('#plViewList'), tracks); }
@@ -409,9 +477,32 @@
   // ===== Альбомы (Локально) =====
   function renderAlbums() {
     var grid = $('#albumGrid'); if (!grid) return; var e = $('#albumEmpty'); if(e) e.hidden = albums.length > 0;
-    grid.innerHTML = albums.map(function (a, idx) { return '<button class="playlist-card" data-album="' + idx + '"><span class="playlist-card__plus">💿</span><b>' + esc(a.name) + '</b><span>' + ((a.tracks || []).length) + ' треков</span></button>'; }).join('');
-    grid.querySelectorAll('[data-album]').forEach(function (card) { card.addEventListener('click', function () { openAlbum(parseInt(card.dataset.album, 10)); }); });
+    grid.innerHTML = albums.map(function (a, idx) { 
+      return '<div class="playlist-card" data-album="' + idx + '">' +
+             '<button class="delete-btn js-del-album" data-idx="' + idx + '" title="Удалить">🗑️</button>' +
+             '<span class="playlist-card__plus">💿</span><b>' + esc(a.name) + '</b><span>' + ((a.tracks || []).length) + ' треков</span></div>'; 
+    }).join('');
+    
+    grid.querySelectorAll('[data-album]').forEach(function (card) { 
+      card.addEventListener('click', function (e) { 
+        if (e.target.closest('.js-del-album')) return; 
+        openAlbum(parseInt(card.dataset.album, 10)); 
+      }); 
+    });
+
+    grid.querySelectorAll('.js-del-album').forEach(function(btn) {
+      btn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        if (!confirm('Удалить этот альбом?')) return;
+        var idx = parseInt(this.getAttribute('data-idx'), 10);
+        albums.splice(idx, 1);
+        save(ALBUM_KEY, albums);
+        renderAlbums();
+        toast('Альбом удален');
+      });
+    });
   }
+  
   function openAlbum(idx) { if (!albums[idx]) return; activeAlbumIdx = idx; renderAlbumDetail(); goPage('alview'); }
   function renderAlbumDetail() { var a = albums[activeAlbumIdx]; if (!a) return; var t = $('#albumViewTitle'); if(t) t.textContent = a.name; var tracks = (a.tracks || []).filter(Boolean); var e = $('#albumViewEmpty'); if(e) e.hidden = tracks.length > 0; renderList($('#albumViewList'), tracks); }
   function openAlbumModal() { var inp = $('#albumNameInput'); if(inp) inp.value = ''; var m = $('#albumModal'); if(m) m.hidden = false; }
