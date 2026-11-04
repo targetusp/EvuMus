@@ -71,7 +71,7 @@ html[data-theme="white"] .logo__music{color:#111418}
 .search-empty{text-align:center;color:var(--text-2);font-size:14px;padding:8px 0 20px}
 .search-empty[hidden]{display:none}
 
-/* СТИЛЬ ТРЕКОВ (КАПСУЛЫ) */
+/* КАПСУЛЫ ТРЕКОВ */
 .track-list{display:flex;flex-direction:column;gap:8px;margin-bottom:8px}
 .track{display:flex;align-items:center;gap:16px;padding:12px 16px;border-radius:22px;background:linear-gradient(112deg,rgba(255,255,255,0.03),rgba(255,255,255,0.08));border:1px solid rgba(255,255,255,0.05);transition:background .2s;box-shadow:0 4px 12px rgba(0,0,0,0.1)}
 .track:hover{background:rgba(255,255,255,0.1)}
@@ -187,13 +187,10 @@ html[data-theme="white"] .logo__music{color:#111418}
 .player__btn{width:40px;height:40px;border-radius:50%;display:grid;place-items:center;color:var(--text);transition:background .2s, transform .2s}
 .player__btn:hover{background:var(--hover)}
 .player__btn svg{width:22px;height:22px}
-
-/* БЕЛАЯ КНОПКА PLAY КАК У КОНКУРЕНТА */
 .player__btn--main{width:48px;height:48px;background:#fff;color:#000;border-radius:50%;box-shadow:0 4px 14px rgba(0,0,0,.25);transition:filter .2s ease,transform .18s ease}
 .player__btn--main svg{width:26px;height:26px}
 .player__btn--main:hover{filter:brightness(0.9);transform:scale(1.05)}
 .player__btn--main:active{transform:scale(.92)}
-
 .player__close{width:36px;height:36px;border-radius:50%;display:grid;place-items:center;color:var(--text-2);margin-left:4px}
 .player__close:hover{background:var(--hover);color:var(--text)}
 .player__close svg{width:18px;height:18px}
@@ -215,11 +212,22 @@ html[data-theme="white"] .logo__music{color:#111418}
 .player__volume-range::-webkit-slider-thumb{-webkit-appearance:none;width:12px;height:12px;border-radius:50%;background:var(--text);cursor:pointer}
 .player__volume-range::-moz-range-thumb{width:12px;height:12px;border:0;border-radius:50%;background:var(--text);cursor:pointer}
 
-/* Мобильная адаптация */
-@media(max-width:860px){
-  .sidebar{width:200px}
-  .content{padding:22px 20px 160px}
+/* БАННЕР */
+.support-banner{position:relative;display:flex;align-items:center;min-height:200px;width:100%;margin:0 0 28px;padding:28px 34px;overflow:hidden;border:1px solid rgba(91,174,255,.28);border-radius:24px;color:#fff;text-decoration:none;background:#07172d url("assets/support-blue.webp") center 58%/cover no-repeat;box-shadow:0 18px 48px rgba(0,0,0,.28)}
+.support-banner::before{content:"";position:absolute;inset:0;background:linear-gradient(90deg,rgba(4,13,27,.96) 0%,rgba(5,18,38,.88) 35%,rgba(5,24,54,.42) 72%,rgba(4,20,46,.12) 100%)}
+.support-banner__content{position:relative;z-index:2;display:flex;align-items:flex-start;flex-direction:column;max-width:390px;gap:9px}
+.support-banner__eyebrow{font-size:10px;font-weight:800;letter-spacing:2.4px;color:#83caff}
+.support-banner__title{font-size:clamp(25px,3vw,36px);line-height:1.04;font-weight:850;letter-spacing:-1.1px}
+.support-banner__desc{font-size:13px;line-height:1.45;color:rgba(235,245,255,.78);margin-top:1px}
+.support-banner__button{display:inline-flex;align-items:center;gap:12px;margin-top:9px;padding:12px 19px;border-radius:999px;background:linear-gradient(135deg,#eaf7ff,#80c9ff);color:#071a31;font-size:12px;font-weight:800}
+.support-banner__shine{position:absolute;inset:0;background:linear-gradient(115deg,transparent 35%,rgba(125,198,255,.10) 52%,transparent 68%);opacity:.7}
+
+/* Скрываем лишнее на мобилке */
+@media(max-width:768px){
+  .hide-mobile{display:none !important}
 }
+
+/* Мобильная адаптация (4 иконки) */
 @media(max-width:640px){
   .app{flex-direction:column;height:calc(100dvh - 56px - 70px)}
   .sidebar{width:100%;height:70px;flex-direction:row;padding:0 8px;gap:0;border-right:none;border-top:1px solid var(--sep);overflow-x:auto;overflow-y:hidden;position:fixed;bottom:0;left:0;right:0;z-index:40;align-items:center;background:var(--sidebar-bg)}
@@ -237,4 +245,9 @@ html[data-theme="white"] .logo__music{color:#111418}
   .section-head h2{font-size:20px}
   .floating-player-container{bottom:80px;left:8px;right:8px}
   .player__volume{display:none}
+  .support-banner{min-height:170px;padding:20px;border-radius:20px;background-position:60% center}
+  .support-banner__content{max-width:70%;gap:4px}
+  .support-banner__title{font-size:24px}
+  .support-banner__desc{font-size:11px}
+  .support-banner__button{padding:8px 14px;font-size:11px}
 }
