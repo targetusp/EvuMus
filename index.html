@@ -60,7 +60,7 @@
 
     <main class="content" id="content">
 
-      <!-- МОЯ МУЗЫКА (Объединяет все треки и любимое) -->
+      <!-- МОЯ МУЗЫКА -->
       <section class="page active" id="page-mymusic">
         <a class="support-banner" href="https://www.donationalerts.com/r/evumusic" target="_blank" rel="noopener noreferrer" aria-label="Поддержать проект EvuMusic на DonationAlerts">
           <span class="support-banner__content">
@@ -72,11 +72,12 @@
           <span class="support-banner__shine" aria-hidden="true"></span>
         </a>
         <div class="tabs">
-          <button class="tab active" data-mymusic-tab="all">Все треки</button>
-          <button class="tab" data-mymusic-tab="fav">Любимое</button>
+          <!-- ИЗМЕНЕНО: Любимое теперь первое и активное -->
+          <button class="tab active" data-mymusic-tab="fav">Любимое</button>
+          <button class="tab" data-mymusic-tab="all">Все треки</button>
         </div>
         <div class="section-head">
-          <h2 id="myPageTitle">Моя музыка</h2>
+          <h2 id="myPageTitle">Любимое</h2>
           <span class="section-count" id="myCount">Треков: 0</span>
         </div>
         <div class="card empty-card" id="myEmpty">
