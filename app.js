@@ -3,6 +3,10 @@
 
   var API_URL = ''; 
 
+  // ПРИНУДИТЕЛЬНО ПРЯЧЕМ ПЛЕЕР ПРИ СТАРТЕ
+  var pcInit = document.getElementById('playerContainer'); if (pcInit) pcInit.hidden = true;
+  var plInit = document.getElementById('player'); if (plInit) plInit.hidden = true;
+
   var TG = window.Telegram && window.Telegram.WebApp;
   if (TG) {
     try { TG.ready(); TG.expand(); TG.setHeaderColor && TG.setHeaderColor('#0e1a27'); } catch (e) {}
