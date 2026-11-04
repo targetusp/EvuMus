@@ -1,7 +1,6 @@
 (function () {
   'use strict';
 
-  // API_URL оставляем пустым, так как сайт и сервер работают на одном домене
   var API_URL = ''; 
 
   var TG = window.Telegram && window.Telegram.WebApp;
@@ -13,13 +12,12 @@
   }
 
   var THEME_KEY = 'evu_theme';
-  var ALBUM_KEY = 'evu_albums_v1'; // Альбомы локально
+  var ALBUM_KEY = 'evu_albums_v1';
   var LANG_KEY = 'evu_language';
   var GLASS_KEY = 'evu_glass_mode';
 
   var THEME_NAMES = { blue: 'Синяя', white: 'Белая', black: 'Чёрная' };
   
-  // Данные с сервера
   var library = [];
   var favs = [];
   var playlists = [];
@@ -187,7 +185,7 @@
       return (d.tracks || []).map(function (t) {
         var dur = t.dur || (t.duration ? Math.floor(t.duration / 60) + ':' + ('0' + (t.duration % 60)).slice(-2) : '');
         return { id: String(t.id), title: t.title, artist: t.artist || '', dur: dur, cover: absUrl(t.cover || ''), preview: absUrl(t.preview_url || t.preview || t.stream_url || ''), full: t.full !== false, source: t.source || 'ru' };
-      }).filter(function (t) { return !!t.preview; });
+      }).filter(function (t) { return !!t.preview && t.full !== false; }); // ЖЕСТКИЙ ФИЛЬТР: только полные треки
     });
   }
 
@@ -217,16 +215,31 @@
       var title = (img.getAttribute('data-title') || '').trim(); var artist = (img.getAttribute('data-artist') || '').trim(); if (!title) return;
       var key = (title + '|' + artist).toLowerCase();
       img.addEventListener('error', function() { img.onerror = null; img.src = coverFallback({id: img.closest('.track') && img.closest('.track').getAttribute('data-id'), title: title, artist: artist}); }, {once:true});
+      
       if (trackCoverCache[key]) { img.src = trackCoverCache[key]; return; }
       if (coverRequests[key]) return;
       coverRequests[key] = true;
+      
+      // Запрос на бэкенд для получения картинки (через iTunes/Deezer)
       fetch(API_URL + '/api/track-cover?title=' + encodeURIComponent(title) + '&artist=' + encodeURIComponent(artist || '')).then(function(r) { return r.json(); }).then(function(d) {
         if (!d || !d.cover) return;
         var image = d.cover;
         trackCoverCache[key] = image; try { save('evu_track_cover_cache_v6', trackCoverCache); } catch(e) {}
+        
+        // Обновляем картинку в списке
         document.querySelectorAll('.js-track-cover[data-title]').forEach(function(el) {
           if (((el.getAttribute('data-title') || '') + '|' + (el.getAttribute('data-artist') || '')).toLowerCase() === key) el.src = image;
         });
+
+        // ОБНОВЛЯЕМ КАРТИНКУ В ПЛЕЕРЕ, ЕСЛИ ЭТОТ ТРЕК СЕЙЧАС ИГРАЕТ
+        if (previewTrackId) {
+            var playingTrack = trackRegistry[previewTrackId];
+            if (playingTrack && ((playingTrack.title || '') + '|' + (playingTrack.artist || '')).toLowerCase() === key) {
+                playingTrack.cover = image; // Сохраняем в реестр
+                var pc = document.getElementById('playerCover');
+                if (pc) { pc.innerHTML = '<img src="' + esc(image) + '" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:10px">'; pc.style.background = 'none'; }
+            }
+        }
       }).catch(function() {}).then(function(){ delete coverRequests[key]; });
     });
   }
@@ -268,7 +281,7 @@
   $('#searchInput').addEventListener('input', function () { clearTimeout(searchTimer); searchTimer = setTimeout(renderSearch, 700); });
   $('#searchInput').addEventListener('keydown', function (e) { if (e.key === 'Enter') { clearTimeout(searchTimer); renderSearch(); } });
 
-  // ===== Альбомы (Deezer) =====
+  // ===== Альбомы (iTunes) =====
   var albumSearchRequestId = 0;
   function renderAlbumSearch(query) {
     var results = $('#searchResults'); var empty = $('#searchEmpty');
@@ -283,23 +296,23 @@
         results.innerHTML = '<div class="search-album-grid">' + items.map(function(a) {
           return '<button class="search-album-card" data-deezer-album="' + esc(a.id) + '"><img src="' + esc(absUrl(a.cover || '')) + '" alt="" loading="lazy"><span class="search-album-card__meta"><b>' + esc(a.title || 'Без названия') + '</b><small>' + esc(a.artist || 'Неизвестен') + '</small><small>' + esc(String(a.nb_tracks || 0)) + ' треков</small></span></button>';
         }).join('') + '</div>';
-        results.querySelectorAll('[data-deezer-album]').forEach(function(card) { card.addEventListener('click', function() { openDeezerAlbum(card.getAttribute('data-deezer-album')); }); });
+        results.querySelectorAll('[data-deezer-album]').forEach(function(card) { card.addEventListener('click', function() { openAlbumTracks(card.getAttribute('data-deezer-album')); }); });
       }
     }).catch(function() { if (requestId !== albumSearchRequestId) return; if(results) results.innerHTML = ''; if(empty) { empty.hidden = false; empty.innerHTML = '<p>Ошибка загрузки альбомов.</p>'; } });
   }
 
-  function openDeezerAlbum(albumId) {
+  function openAlbumTracks(albumId) {
     var results = $('#searchResults'); var empty = $('#searchEmpty');
     if(results) results.innerHTML = '<div class="search-hint">Загружаю альбом…</div>'; if(empty) empty.hidden = true;
     fetch(API_URL + '/api/deezer/album/' + encodeURIComponent(albumId)).then(function(r) { return r.json(); }).then(function(data) {
       var tracks = (data.tracks || []).map(function(t) {
-        var track = { id: 'deezer_' + t.id, title: t.title || 'Без названия', artist: t.artist || '', dur: t.dur || '', cover: absUrl(t.cover || ''), preview: t.preview || '', full: false, source: 'deezer' };
+        var track = { id: 'itunes_' + t.id, title: t.title || 'Без названия', artist: t.artist || '', dur: t.dur || '', cover: absUrl(t.cover || ''), preview: t.preview || '', full: false, source: 'itunes' };
         registerTrack(track); return track;
       });
       if(results) {
-        results.innerHTML = '<div class="album-search-detail"><button class="btn-back" id="deezerAlbumBack">← Назад</button><div class="album-search-heading"><img src="' + esc(absUrl(data.album.cover || '')) + '" alt=""><div><h3>' + esc(data.album.title || 'Альбом') + '</h3><p>' + esc(data.album.artist || '') + '</p></div></div><div class="track-list" id="deezerAlbumTracks"></div></div>';
-        var db = $('#deezerAlbumBack'); if(db) db.addEventListener('click', function() { renderAlbumSearch(($('#searchInput').value || '').trim()); });
-        renderList($('#deezerAlbumTracks'), tracks);
+        results.innerHTML = '<div class="album-search-detail"><button class="btn-back" id="albumTracksBack">← Назад</button><div class="album-search-heading"><img src="' + esc(absUrl(data.album.cover || '')) + '" alt=""><div><h3>' + esc(data.album.title || 'Альбом') + '</h3><p>' + esc(data.album.artist || '') + '</p></div></div><div class="track-list" id="albumTracksList"></div></div>';
+        var db = $('#albumTracksBack'); if(db) db.addEventListener('click', function() { renderAlbumSearch(($('#searchInput').value || '').trim()); });
+        renderList($('#albumTracksList'), tracks);
       }
     }).catch(function() { if(results) results.innerHTML = '<p class="search-empty">Ошибка загрузки.</p>'; });
   }
@@ -434,6 +447,9 @@
 
   function playPreview(t) {
     if (previewAudio && previewTrackId === String(t.id)) { if (previewAudio.paused) { previewAudio.play(); setPlayingUI(true); } else { previewAudio.pause(); setPlayingUI(false); } return; }
+    // Проверяем, есть ли уже загруженная картинка в кэше, чтобы сразу подставить в плеер
+    var key = ((t.title || '') + '|' + (t.artist || '')).toLowerCase();
+    if (trackCoverCache[key]) t.cover = trackCoverCache[key];
     startAudio(t.preview, t); showPlayer(t); setPlayingUI(true);
   }
   function setPlayingUI(on) {
@@ -441,9 +457,16 @@
   }
   function updateRowPlayState() { $$('.track').forEach(function (r) { var b = r.querySelector('.track__btn.js-play'); if (!b) return; var cur = !!(onPlaying() && previewTrackId && r.getAttribute('data-id') === previewTrackId); r.classList.toggle('is-current', cur); b.innerHTML = cur ? pauseSvg() : playSvg(); }); }
   function onPlaying() { return !!playerState.playing; }
+  
   function showPlayer(t) {
     var pl = $('#player'); if(pl) pl.hidden = false; var pt = $('#playerTitle'); if(pt) pt.textContent = t.title; var pa = $('#playerArtist'); if(pa) pa.textContent = t.artist; var c = $('#playerCover');
-    if (c) { var art = t.cover || ''; if (art) { c.innerHTML = '<img src="' + esc(art) + '" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:10px">'; c.style.background = 'none'; } else { c.innerHTML = ''; c.style.background = coverColor(String(t.id).length + (t.title || '').length); c.textContent = coverLetter(t.title); } }
+    if (c) { 
+        // Берем картинку из кэша, если есть
+        var key = ((t.title || '') + '|' + (t.artist || '')).toLowerCase();
+        var art = trackCoverCache[key] || t.cover || ''; 
+        if (art) { c.innerHTML = '<img src="' + esc(art) + '" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:10px">'; c.style.background = 'none'; } 
+        else { c.innerHTML = ''; c.style.background = coverColor(String(t.id).length + (t.title || '').length); c.textContent = coverLetter(t.title); } 
+    }
     setPlayingUI(true);
   }
   function stopPreview() { if (previewAudio) { previewAudio.pause(); previewAudio = null; previewTrackId = null; } }
