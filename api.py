@@ -33,8 +33,12 @@ DEFAULT_SC_CLIENT_ID = "nIjtjiYnjkOhMyh5xrbqEW12DxeJVnic"
 SC_CLIENT_ID = (os.getenv("SC_CLIENT_ID", "") or DEFAULT_SC_CLIENT_ID).strip()
 SC_API = "https://api-v2.soundcloud.com"
 ITUNES_API = "https://itunes.apple.com"
-DEEZER_API = "https://api.deezer.com"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+# --- НОВЫЕ API ДЛЯ ОБЛОЖЕК ---
+THEAUDIODB_API = "https://www.theaudiodb.com/api/v1/json/2"
+MUSICBRAINZ_API = "https://musicbrainz.org/ws/2"
+COVERARTARCHIVE_API = "https://coverartarchive.org"
 
 pool: Optional[asyncpg.Pool] = None
 _http: Optional[httpx.AsyncClient] = None
@@ -333,7 +337,7 @@ async def yandex_search(query: str, limit: int) -> list:
     except Exception: return []
 
 # ==========================================
-# ЭНДПОИНТЫ ПОИСКА (ФИЛЬТРУЕМ 30-СЕКУНДНЫЕ)
+# ЭНДПОИНТЫ ПОИСКА (ФИЛЬТР 30-СЕКУНДНЫХ)
 # ==========================================
 @app.get("/api/search")
 async def search(q: Optional[str] = Query(None), query: Optional[str] = Query(None), limit: int = Query(30, ge=1, le=100)):
@@ -353,7 +357,7 @@ async def search(q: Optional[str] = Query(None), query: Optional[str] = Query(No
                 if key in seen: continue
                 seen.add(key); merged.append(t)
         
-        # ЖЕСТКИЙ ФИЛЬТР: Убираем всё, что не является полным треком (iTunes/Deezer превью)
+        # ЖЕСТКИЙ ФИЛЬТР: Убираем всё, что не является полным треком
         merged = [t for t in merged if t.get("full") is not False and t.get("source") not in ("itunes", "deezer")]
         
         merged = rank(merged, term)[:limit]
@@ -361,7 +365,7 @@ async def search(q: Optional[str] = Query(None), query: Optional[str] = Query(No
     except Exception: return {"tracks": []}
 
 # ==========================================
-# АЛЬБОМЫ И ОБЛОЖКИ
+# АЛЬБОМЫ И ОБЛОЖКИ (ITUNES + THEAUDIODB + MUSICBRAINZ)
 # ==========================================
 @app.get("/api/search/albums")
 async def search_albums(q: Optional[str] = Query(None), query: Optional[str] = Query(None), limit: int = Query(30, ge=1, le=50)):
@@ -386,7 +390,7 @@ async def search_albums(q: Optional[str] = Query(None), query: Optional[str] = Q
         return {"albums": albums}
     except Exception: return {"albums": []}
 
-@app.get("/api/deezer/album/{album_id}")
+@app.get("/api/itunes/album/{album_id}")
 async def get_album(album_id: str):
     if not album_id.isdigit(): raise HTTPException(status_code=400, detail="Invalid album ID")
     try:
@@ -425,13 +429,15 @@ async def get_album(album_id: str):
         }
     except Exception: raise HTTPException(status_code=502, detail="Could not load album")
 
+
+# --- НОВАЯ МНОГОУРОВНЕВАЯ ФУНКЦИЯ ПОИСКА ОБЛОЖЕК ---
 @app.get("/api/track-cover")
 async def get_track_cover(title: str = Query(...), artist: str = Query("")):
     title, artist = norm(title), norm(artist)
     if not title: return {"cover": ""}
-    search_query = f"{artist} {title}" if artist else title
-    
-    # 1. Пытаемся найти в iTunes (Apple Music)
+    search_query = f"{artist} {title}".strip()
+
+    # 1. Пытаемся найти в iTunes (самый быстрый и надежный для популярной музыки)
     try:
         r = await get_http().get(ITUNES_API + "/search", params={"term": search_query, "entity": "song", "limit": 1})
         if r.status_code == 200:
@@ -441,15 +447,33 @@ async def get_track_cover(title: str = Query(...), artist: str = Query("")):
                 if cover_url: return {"cover": cover_url}
     except Exception: pass
 
-    # 2. Если не нашли - пробуем Deezer
+    # 2. Пытаемся найти в TheAudioDB (публичный тестовый ключ "2")
     try:
-        r = await get_http().get(DEEZER_API + "/search", params={"q": search_query, "limit": 1})
+        r = await get_http().get(THEAUDIODB_API + "/searchalbum.php", params={"s": artist, "a": title})
         if r.status_code == 200:
-            tracks = r.json().get("data", [])
-            if tracks:
-                best = tracks[0]
-                cover_url = (best.get("album") or {}).get("cover_xl") or (best.get("album") or {}).get("cover_big") or ""
+            data = r.json()
+            if data and "album" in data and data["album"]:
+                album = data["album"][0]
+                cover_url = album.get("strAlbumThumb") or album.get("strAlbumThumbHQ")
                 if cover_url: return {"cover": cover_url}
+    except Exception: pass
+
+    # 3. Пытаемся найти через MusicBrainz + Cover Art Archive (для андеграунда и ремиксов)
+    try:
+        # Ищем релиз в MusicBrainz
+        r = await get_http().get(MUSICBRAINZ_API + "/release/", params={"query": f"artist:{artist} AND release:{title}", "limit": 1})
+        if r.status_code == 200:
+            data = r.json()
+            releases = data.get("releases", [])
+            if releases:
+                mbid = releases[0].get("id")
+                if mbid:
+                    # Запрашиваем обложку в Cover Art Archive
+                    caa_url = f"{COVERARTARCHIVE_API}/release/{mbid}/front-500"
+                    # Мы не скачиваем картинку, а проверяем, существует ли она (HEAD запрос)
+                    check = await get_http().head(caa_url)
+                    if check.status_code == 200:
+                        return {"cover": caa_url}
     except Exception: pass
 
     return {"cover": ""}
