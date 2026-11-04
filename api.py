@@ -32,7 +32,8 @@ PROXY_SECRET = os.getenv("PROXY_SECRET", "evu-music-proxy-secret").encode()
 DEFAULT_SC_CLIENT_ID = "nIjtjiYnjkOhMyh5xrbqEW12DxeJVnic"
 SC_CLIENT_ID = (os.getenv("SC_CLIENT_ID", "") or DEFAULT_SC_CLIENT_ID).strip()
 SC_API = "https://api-v2.soundcloud.com"
-ITUNES_API = "https://itunes.apple.com" # ЗАМЕНИЛИ DEEZER НА ITUNES
+ITUNES_API = "https://itunes.apple.com"
+DEEZER_API = "https://api.deezer.com"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 pool: Optional[asyncpg.Pool] = None
@@ -208,7 +209,7 @@ def rank(tracks: list, query: str) -> list:
     return tracks
 
 # ==========================================
-# ПОИСКОВИКИ (Muzofond, SC, Yandex)
+# ПОИСКОВИКИ
 # ==========================================
 _ITEM_SPLIT = re.compile(r'<li class="item" ')
 _DL_RE = re.compile(r'class="play" data-id="\d+" data-url="(https://dl[^"]+)"')
@@ -332,7 +333,7 @@ async def yandex_search(query: str, limit: int) -> list:
     except Exception: return []
 
 # ==========================================
-# ЭНДПОИНТЫ ПОИСКА
+# ЭНДПОИНТЫ ПОИСКА (ФИЛЬТРУЕМ 30-СЕКУНДНЫЕ)
 # ==========================================
 @app.get("/api/search")
 async def search(q: Optional[str] = Query(None), query: Optional[str] = Query(None), limit: int = Query(30, ge=1, le=100)):
@@ -351,12 +352,16 @@ async def search(q: Optional[str] = Query(None), query: Optional[str] = Query(No
                 key = (str(t.get("artist") or "").lower(), str(t.get("title") or "").lower())
                 if key in seen: continue
                 seen.add(key); merged.append(t)
+        
+        # ЖЕСТКИЙ ФИЛЬТР: Убираем всё, что не является полным треком (iTunes/Deezer превью)
+        merged = [t for t in merged if t.get("full") is not False and t.get("source") not in ("itunes", "deezer")]
+        
         merged = rank(merged, term)[:limit]
         return {"tracks": [pack(t) for t in merged]}
     except Exception: return {"tracks": []}
 
 # ==========================================
-# АЛЬБОМЫ И ОБЛОЖКИ (ТЕПЕРЬ ITUNES)
+# АЛЬБОМЫ И ОБЛОЖКИ
 # ==========================================
 @app.get("/api/search/albums")
 async def search_albums(q: Optional[str] = Query(None), query: Optional[str] = Query(None), limit: int = Query(30, ge=1, le=50)):
@@ -381,7 +386,7 @@ async def search_albums(q: Optional[str] = Query(None), query: Optional[str] = Q
         return {"albums": albums}
     except Exception: return {"albums": []}
 
-@app.get("/api/deezer/album/{album_id}") # Оставил путь прежним, чтобы фронтенд не сломался
+@app.get("/api/deezer/album/{album_id}")
 async def get_album(album_id: str):
     if not album_id.isdigit(): raise HTTPException(status_code=400, detail="Invalid album ID")
     try:
@@ -391,9 +396,9 @@ async def get_album(album_id: str):
         
         if not data: raise HTTPException(status_code=404, detail="Album not found")
         
-        album_info = data[0] # Первый элемент - сам альбом
+        album_info = data[0]
         tracks = []
-        for t in data[1:]: # Остальные - треки
+        for t in data[1:]:
             cover = t.get("artworkUrl100", "").replace("100x100bb", "600x600bb")
             tracks.append({
                 "id": str(t.get("trackId", "")),
@@ -425,14 +430,29 @@ async def get_track_cover(title: str = Query(...), artist: str = Query("")):
     title, artist = norm(title), norm(artist)
     if not title: return {"cover": ""}
     search_query = f"{artist} {title}" if artist else title
+    
+    # 1. Пытаемся найти в iTunes (Apple Music)
     try:
         r = await get_http().get(ITUNES_API + "/search", params={"term": search_query, "entity": "song", "limit": 1})
-        if r.status_code != 200: return {"cover": ""}
-        tracks = r.json().get("results", [])
-        if not tracks: return {"cover": ""}
-        cover_url = tracks[0].get("artworkUrl100", "").replace("100x100bb", "600x600bb")
-        return {"cover": cover_url}
-    except Exception: return {"cover": ""}
+        if r.status_code == 200:
+            tracks = r.json().get("results", [])
+            if tracks:
+                cover_url = tracks[0].get("artworkUrl100", "").replace("100x100bb", "600x600bb")
+                if cover_url: return {"cover": cover_url}
+    except Exception: pass
+
+    # 2. Если не нашли - пробуем Deezer
+    try:
+        r = await get_http().get(DEEZER_API + "/search", params={"q": search_query, "limit": 1})
+        if r.status_code == 200:
+            tracks = r.json().get("data", [])
+            if tracks:
+                best = tracks[0]
+                cover_url = (best.get("album") or {}).get("cover_xl") or (best.get("album") or {}).get("cover_big") or ""
+                if cover_url: return {"cover": cover_url}
+    except Exception: pass
+
+    return {"cover": ""}
 
 # ==========================================
 # СТРИМИНГ
