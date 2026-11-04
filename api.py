@@ -204,7 +204,7 @@ async def add_track_to_playlist(data: PlaylistTrackData, user_id: int = Depends(
     return {"status": "ok"}
 
 # ==========================================
-# ОТПРАВКА В ЧАТ
+# ОТПРАВКА В ЧАТ (С ВОДЯНЫМ ЗНАКОМ)
 # ==========================================
 @app.post("/api/send_to_chat")
 async def send_to_chat(track: TrackData, user_id: int = Depends(get_user_id)):
@@ -214,13 +214,26 @@ async def send_to_chat(track: TrackData, user_id: int = Depends(get_user_id)):
         audio_url = os.getenv("API_BASE_URL", "https://evumus.onrender.com") + audio_url
 
     tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendAudio"
-    payload = {"chat_id": user_id, "audio": audio_url, "title": track.title, "performer": track.artist, "caption": f"🎵 {track.title} — {track.artist}"}
+    
+    # ДОБАВЛЯЕМ ПОДПИСЬ С БОТОМ
+    watermark = "\n\n🤖 Скачано через: @EvuMusicBot"
+    caption_text = f"🎵 {track.title} — {track.artist}{watermark}"
+    
+    payload = {
+        "chat_id": user_id, 
+        "audio": audio_url, 
+        "title": track.title, 
+        "performer": track.artist, 
+        "caption": caption_text
+    }
     
     try:
         async with httpx.AsyncClient() as client:
             res = await client.post(tg_url, json=payload, timeout=10.0)
+            # Если аудио не удалось отправить, отправляем текстом с той же ссылкой
             if res.status_code != 200:
-                await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id": user_id, "text": f"🎵 {track.title}\n{audio_url}"})
+                fallback_text = f"🎵 {track.title}\n{audio_url}{watermark}"
+                await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id": user_id, "text": fallback_text})
     except Exception: pass
     return {"status": "ok"}
 
@@ -539,7 +552,6 @@ async def search_albums(q: Optional[str] = Query(None), query: Optional[str] = Q
 async def get_album(album_id: str):
     if not album_id.isdigit(): raise HTTPException(status_code=400, detail="Invalid ID")
     
-    # Проверка кеша
     if album_id in _album_cache:
         return _album_cache[album_id]
 
@@ -559,7 +571,6 @@ async def get_album(album_id: str):
             })
         result = {"album": {"id": str(album_info.get("collectionId", "")), "title": album_info.get("collectionName", ""), "artist": album_info.get("artistName", ""), "cover": album_info.get("artworkUrl100", "").replace("100x100bb", "600x600bb")}, "tracks": tracks}
         
-        # Сохраняем в кеш
         _album_cache[album_id] = result
         return result
     except Exception: raise HTTPException(status_code=502, detail="Error")
