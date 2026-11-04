@@ -45,7 +45,7 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("DATABASE_URL environment variable is missing")
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
     
-    # АВТОМИГРАЦИЯ: Создаем таблицы и добавляем колонку preview, если её нет
+    # АВТОМИГРАЦИЯ
     async with pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS favorites (
@@ -192,6 +192,14 @@ async def toggle_favorite(track: TrackData, user_id: int = Depends(get_user_id))
             return {"status": "removed"}
         await conn.execute("INSERT INTO favorites (user_id, track_id, title, artist, duration, cover, source, preview) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)", user_id, track.id, track.title, track.artist, track.duration, track.cover, track.source, track.preview)
         return {"status": "added"}
+
+@app.post("/api/update_preview")
+async def update_preview(track: TrackData, user_id: int = Depends(get_user_id)):
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE favorites SET preview=$1 WHERE user_id=$2 AND track_id=$3", track.preview, user_id, track.id)
+        await conn.execute("UPDATE library_tracks SET preview=$1 WHERE user_id=$2 AND track_id=$3", track.preview, user_id, track.id)
+        await conn.execute("UPDATE playlist_tracks SET preview=$1 WHERE playlist_id IN (SELECT id FROM playlists WHERE user_id=$2) AND track_id=$3", track.preview, user_id, track.id)
+    return {"status": "ok"}
 
 @app.post("/api/playlists")
 async def create_playlist(data: PlaylistData, user_id: int = Depends(get_user_id)):
