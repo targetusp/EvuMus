@@ -38,7 +38,8 @@
   var theme = load(THEME_KEY, 'blue');
   if (!Array.isArray(albums)) albums = [];
 
-  var mymusicTab = 'all';
+  // ИЗМЕНЕНО: Дефолтная вкладка теперь 'fav' (Любимое)
+  var mymusicTab = 'fav';
   var searchTab = 'tracks';
 
   var trackRegistry = {};
@@ -221,7 +222,6 @@
     t.cover = ownCover;
     var cover = '<img class="track__cover track__cover-image js-track-cover" data-title="' + esc(t.title || '') + '" data-artist="' + esc(t.artist || '') + '" src="' + ownCover + '" alt="" loading="lazy">';
     
-    // ДОБАВЛЕНА 4-Я КНОПКА (ОТПРАВИТЬ)
     return '<div class="track" data-id="' + esc(String(t.id)) + '">' + cover +
       '<div class="track__meta"><div class="track__title">' + esc(t.title) + '</div><div class="track__artist">' + esc(t.artist) + (t.dur ? ' · ' + esc(t.dur) : '') + '</div></div>' +
       '<div class="track__actions">' +
