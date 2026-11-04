@@ -178,6 +178,7 @@
     });
   }
 
+  // ИСПРАВЛЕНА ФУНКЦИЯ ВОССТАНОВЛЕНИЯ (Больше не меняет ID)
   async function restorePreview(tr) {
     if (tr.preview) return true;
     toast('Восстанавливаю ссылку...');
@@ -186,16 +187,22 @@
       var data = await res.json();
       if (data.tracks && data.tracks.length > 0) {
           var newTrack = data.tracks[0];
-          tr.preview = newTrack.preview; tr.cover = newTrack.cover; tr.source = newTrack.source; tr.id = newTrack.id; 
+          var oldId = tr.id; // СОХРАНЯЕМ СТАРЫЙ ID
+          
+          tr.preview = newTrack.preview; 
+          tr.cover = newTrack.cover; 
+          tr.source = newTrack.source; 
+          
           await fetch(API_URL + '/api/update_preview', {
               method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, getAuthHeader()),
-              body: JSON.stringify({ id: String(tr.id), title: tr.title, artist: tr.artist, preview: tr.preview })
+              body: JSON.stringify({ id: String(oldId), title: tr.title, artist: tr.artist, preview: tr.preview })
           });
-          trackRegistry[tr.id] = tr;
+          
+          trackRegistry[oldId] = tr;
           return true;
       }
     } catch (e) {}
-    toast('Не удалось найти превью');
+    toast('Не удалось найти превью для этого трека');
     return false;
   }
 
@@ -260,7 +267,6 @@
   var preloadedAudios = {};
   function preloadAudio(url) {
     if (!url || preloadedAudios[url]) return;
-    // Скачиваем первые 100кб, чтобы браузер их закешировал
     fetch(url, { headers: { 'Range': 'bytes=0-100000' }, cache: 'force-cache' }).catch(function(){});
     var audio = new Audio();
     audio.preload = 'auto';
@@ -292,7 +298,6 @@
     var input = $('#searchInput'); if (!input) return; var q = (input.value || '').trim();
     if (searchTab === 'albums') { renderAlbumSearch(q); renderCollection(); return; }
     
-    // Показываем лоадер сразу
     var empty = $('#searchEmpty'); if(empty) empty.hidden = true; 
     var res = $('#searchResults'); if(res) res.innerHTML = '<div class="search-hint">Ищу треки…</div>';
     
@@ -525,7 +530,18 @@
   function setPlayingUI(on) {
     playerState.playing = on; var ip = $('#iconPlay'); if(ip) ip.toggleAttribute('hidden', on); var ipa = $('#iconPause'); if(ipa) ipa.toggleAttribute('hidden', !on); var pl = $('#player'); if(pl) pl.classList.toggle('is-playing', on); updateRowPlayState();
   }
-  function updateRowPlayState() { $$('.track').forEach(function (r) { var b = r.querySelector('.track__btn.js-play'); if (!b) return; var cur = !!(onPlaying() && previewTrackId && r.getAttribute('data-id') === previewTrackId); r.classList.toggle('is-current', cur); b.innerHTML = cur ? pauseSvg() : playSvg(); }); }
+  
+  // ОБНОВЛЕННАЯ ФУНКЦИЯ ПОДСВЕТКИ
+  function updateRowPlayState() { 
+    $$('.track').forEach(function (r) { 
+      var b = r.querySelector('.track__btn.js-play'); 
+      if (!b) return; 
+      var cur = !!(onPlaying() && previewTrackId && r.getAttribute('data-id') === previewTrackId); 
+      r.classList.toggle('is-current', cur); 
+      b.innerHTML = cur ? pauseSvg() : playSvg(); 
+    }); 
+  }
+  
   function onPlaying() { return !!playerState.playing; }
   
   function showPlayer(t) {
