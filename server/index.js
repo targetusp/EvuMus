@@ -11,13 +11,20 @@ import pg from 'pg';
 import { Bot, InlineKeyboard } from 'grammy';
 
 const { Pool } = pg;
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
-const PYTHON_DIR = path.join(ROOT, 'ru-backend');
+
+// api.py находится в корне проекта
+const PYTHON_DIR = ROOT;
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
-const WEBAPP_URL = (process.env.WEBAPP_URL || 'http://localhost:8080').replace(/\/+$/, '');
+
+const WEBAPP_URL = (
+  process.env.WEBAPP_URL || 'http://localhost:8080'
+).replace(/\/+$/, '');
+
 const PORT = Number(process.env.PORT || 8080);
 const PYTHON_API_PORT = Number(process.env.PYTHON_API_PORT || 8001);
 const PYTHON_HOST = '127.0.0.1';
@@ -35,19 +42,32 @@ const MUSIC_CHANNELS = (
   .map(s => s.trim().replace(/^@/, ''))
   .filter(Boolean);
 
-if (!BOT_TOKEN) throw new Error('BOT_TOKEN не задан в Environment');
-if (!DATABASE_URL) throw new Error('DATABASE_URL не задан в Environment');
+if (!BOT_TOKEN) {
+  throw new Error('BOT_TOKEN не задан в Environment');
+}
 
-const PYTHON_FILE = ['main.py', 'api.py']
+if (!DATABASE_URL) {
+  throw new Error('DATABASE_URL не задан в Environment');
+}
+
+// Ищем Python API в корне проекта
+const PYTHON_FILE = ['api.py', 'main.py']
   .map(name => path.join(PYTHON_DIR, name))
   .find(file => fs.existsSync(file));
 
 if (!PYTHON_FILE) {
-  throw new Error('Не найден ru-backend/main.py или ru-backend/api.py');
+  throw new Error('Не найден api.py или main.py в корне проекта');
 }
 
 const PYTHON_MODULE = path.basename(PYTHON_FILE, '.py');
-const PYTHON_BIN = process.env.PYTHON_BIN || '/opt/venv/bin/python';
+
+const VENV_PYTHON = '/opt/venv/bin/python';
+
+const PYTHON_BIN = process.env.PYTHON_BIN || (
+  fs.existsSync(VENV_PYTHON)
+    ? VENV_PYTHON
+    : 'python3'
+);
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -59,10 +79,11 @@ const pool = new Pool({
   connectionTimeoutMillis: 10000,
 });
 
+
 /* ================= DATABASE ================= */
 
 async function upsertUser(user, invitedBy = null) {
-  const isAdmin = ADMIN_IDS.includes(user.id);
+  const isAdmin = ADMIN_IDS.includes(Number(user.id));
 
   await pool.query(
     `INSERT INTO users
@@ -93,6 +114,7 @@ async function saveTrackFromChannel(msg) {
 
   const title = audio.title || msg.caption || 'Без названия';
   const artist = audio.performer || 'Неизвестен';
+
   const duration = audio.duration
     ? `${Math.floor(audio.duration / 60)}:${String(audio.duration % 60).padStart(2, '0')}`
     : null;
@@ -172,10 +194,15 @@ async function useInviteCode(code, telegramId) {
 
     await client.query('COMMIT');
 
-    return { ok: true, inviter: rows[0].created_by };
+    return {
+      ok: true,
+      inviter: rows[0].created_by
+    };
+
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;
+
   } finally {
     client.release();
   }
@@ -192,18 +219,28 @@ async function createInviteCode(telegramId) {
   return code;
 }
 
+
 /* ================= TELEGRAM BOT ================= */
 
 const bot = new Bot(BOT_TOKEN);
 
 function appBtn(label = 'Открыть EvuMusic') {
-  return InlineKeyboard.webApp(label, `${WEBAPP_URL}/index.html`);
+  return InlineKeyboard.webApp(
+    label,
+    `${WEBAPP_URL}/index.html`
+  );
 }
 
 function startKb() {
   return new InlineKeyboard()
-    .webApp('Открыть EvuMusic', `${WEBAPP_URL}/index.html`)
-    .url('Канал с обновлениями', 'https://t.me/EvuMusic');
+    .webApp(
+      'Открыть EvuMusic',
+      `${WEBAPP_URL}/index.html`
+    )
+    .url(
+      'Канал с обновлениями',
+      'https://t.me/EvuMusic'
+    );
 }
 
 bot.command('start', async ctx => {
@@ -212,13 +249,23 @@ bot.command('start', async ctx => {
 
   if (payload.startsWith('ref_')) {
     const id = Number(payload.slice(4));
-    if (Number.isFinite(id)) invitedBy = id;
+
+    if (Number.isFinite(id)) {
+      invitedBy = id;
+    }
   }
 
   if (payload.startsWith('inv_')) {
     try {
-      const result = await useInviteCode(payload.slice(4), ctx.from.id);
-      if (result.ok) invitedBy = result.inviter;
+      const result = await useInviteCode(
+        payload.slice(4),
+        ctx.from.id
+      );
+
+      if (result.ok) {
+        invitedBy = result.inviter;
+      }
+
     } catch (error) {
       console.error('Invite error:', error);
     }
@@ -229,7 +276,9 @@ bot.command('start', async ctx => {
   await ctx.reply(
     'Твоя музыка, всегда рядом.\n\n' +
     'Напиши название песни или открой плеер: поиск, любимые треки и личные плейлисты.',
-    { reply_markup: startKb() }
+    {
+      reply_markup: startKb()
+    }
   );
 });
 
@@ -247,7 +296,9 @@ bot.command('help', async ctx => {
     '/search запрос — найти трек\n' +
     '/invite — создать инвайт (админ)\n' +
     '/stats — статистика (админ)',
-    { reply_markup: appBtn() }
+    {
+      reply_markup: appBtn()
+    }
   );
 });
 
@@ -350,15 +401,25 @@ bot.on('channel_post', async ctx => {
       MUSIC_CHANNELS.length &&
       ctx.chat.username &&
       !MUSIC_CHANNELS.some(
-        channel => channel.toLowerCase() === ctx.chat.username.toLowerCase()
+        channel =>
+          channel.toLowerCase() ===
+          ctx.chat.username.toLowerCase()
       )
-    ) return;
+    ) {
+      return;
+    }
 
-    const saved = await saveTrackFromChannel(ctx.message || ctx.channelPost);
+    const saved = await saveTrackFromChannel(
+      ctx.channelPost
+    );
 
     if (saved) {
-      console.log('Saved track from channel:', saved.id);
+      console.log(
+        'Saved track from channel:',
+        saved.id
+      );
     }
+
   } catch (error) {
     console.error('channel_post save error:', error);
   }
@@ -366,15 +427,22 @@ bot.on('channel_post', async ctx => {
 
 bot.on('message:audio', async ctx => {
   try {
-    const saved = await saveTrackFromChannel(ctx.message);
+    const saved = await saveTrackFromChannel(
+      ctx.message
+    );
 
     if (saved) {
-      console.log('Saved track from DM:', saved.id, saved.title);
+      console.log(
+        'Saved track from DM:',
+        saved.id,
+        saved.title
+      );
 
       if (ADMIN_IDS.includes(ctx.from.id)) {
         await ctx.reply(`✅ Сохранено: ${saved.title}`);
       }
     }
+
   } catch (error) {
     console.error('audio save error:', error);
   }
@@ -423,7 +491,18 @@ bot.catch(error => {
   console.error('Bot error:', error.error);
 });
 
-/* ================= API ================= */
+
+/* ================= EXPRESS ================= */
+
+const app = express();
+
+let pythonReady = false;
+let pythonProcess = null;
+let httpServer = null;
+let shuttingDown = false;
+
+
+/* ================= TELEGRAM AUTH ================= */
 
 function validInitData(initData) {
   if (!initData || !BOT_TOKEN) return false;
@@ -454,9 +533,15 @@ function validInitData(initData) {
     const actualBuffer = Buffer.from(hash, 'hex');
     const expectedBuffer = Buffer.from(expected, 'hex');
 
-    return actualBuffer.length === expectedBuffer.length &&
+    return (
+      actualBuffer.length === expectedBuffer.length &&
       actualBuffer.length > 0 &&
-      crypto.timingSafeEqual(actualBuffer, expectedBuffer);
+      crypto.timingSafeEqual(
+        actualBuffer,
+        expectedBuffer
+      )
+    );
+
   } catch {
     return false;
   }
@@ -466,20 +551,25 @@ function userFromInitData(initData) {
   try {
     const params = new URLSearchParams(initData);
     const user = params.get('user');
+
     return user ? JSON.parse(user) : null;
+
   } catch {
     return null;
   }
 }
 
-const app = express();
 
-/* Node API: поиск по локальной базе канала */
+/* ================= NODE API ================= */
+
+// Поиск по локальной базе канала
 app.get('/api/channel-search', async (req, res) => {
   try {
     const q = String(req.query.q || '').trim();
 
-    if (q.length < 2) return res.json({ tracks: [] });
+    if (q.length < 2) {
+      return res.json({ tracks: [] });
+    }
 
     const tracks = await searchTracks(q, 30);
 
@@ -491,13 +581,18 @@ app.get('/api/channel-search', async (req, res) => {
         duration: track.duration
       }))
     });
+
   } catch (error) {
     console.error('Channel search error:', error);
-    res.status(500).json({ error: 'channel_search_failed' });
+
+    res.status(500).json({
+      error: 'channel_search_failed'
+    });
   }
 });
 
-/* Треки из Telegram-канала */
+
+// Треки из Telegram-канала
 app.get('/api/tracks', async (_req, res) => {
   try {
     const { rows } = await pool.query(
@@ -508,26 +603,36 @@ app.get('/api/tracks', async (_req, res) => {
     );
 
     res.json({ tracks: rows });
+
   } catch (error) {
     console.error('Tracks error:', error);
-    res.status(500).json({ error: 'tracks_failed' });
+
+    res.status(500).json({
+      error: 'tracks_failed'
+    });
   }
 });
 
-/* Отправка трека пользователю в Telegram */
+
+// Отправка трека пользователю в Telegram
 app.post('/api/send', express.json(), async (req, res) => {
   try {
     const { initData, trackId } = req.body || {};
+
     const user = userFromInitData(initData);
 
     if (!user || !validInitData(initData)) {
-      return res.status(401).json({ error: 'auth' });
+      return res.status(401).json({
+        error: 'auth'
+      });
     }
 
     const track = await getTrack(Number(trackId));
 
     if (!track) {
-      return res.status(404).json({ error: 'not_found' });
+      return res.status(404).json({
+        error: 'not_found'
+      });
     }
 
     await bot.api.sendAudio(user.id, track.file_id, {
@@ -539,6 +644,7 @@ app.post('/api/send', express.json(), async (req, res) => {
     await upsertUser(user);
 
     res.json({ ok: true });
+
   } catch (error) {
     console.error('Send track error:', error);
 
@@ -549,12 +655,15 @@ app.post('/api/send', express.json(), async (req, res) => {
   }
 });
 
-/* Расширенный поиск по локальной базе */
+
+// Расширенный поиск по локальной базе
 app.get('/api/advanced', async (req, res) => {
   try {
     const q = String(req.query.q || '').trim();
 
-    if (q.length < 2) return res.json({ tracks: [] });
+    if (q.length < 2) {
+      return res.json({ tracks: [] });
+    }
 
     const tracks = await searchTracks(q, 50);
 
@@ -567,13 +676,18 @@ app.get('/api/advanced', async (req, res) => {
         source: 'channel'
       }))
     });
+
   } catch (error) {
     console.error('Advanced search error:', error);
-    res.status(500).json({ error: 'advanced_search_failed' });
+
+    res.status(500).json({
+      error: 'advanced_search_failed'
+    });
   }
 });
 
-/* Проверка состояния обоих серверов */
+
+// Состояние Node и Python
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
@@ -582,10 +696,8 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
-/* ================= PYTHON PROCESS ================= */
 
-let pythonReady = false;
-let pythonProcess = null;
+/* ================= PYTHON PROCESS ================= */
 
 function startPython() {
   pythonProcess = spawn(
@@ -612,15 +724,7 @@ function startPython() {
   );
 
   pythonProcess.stdout.on('data', data => {
-    const output = data.toString();
-    console.log(`[Python] ${output.trim()}`);
-
-    if (
-      output.includes('Application startup complete') ||
-      output.includes('Uvicorn running')
-    ) {
-      pythonReady = true;
-    }
+    console.log(`[Python] ${data.toString().trim()}`);
   });
 
   pythonProcess.stderr.on('data', data => {
@@ -633,22 +737,80 @@ function startPython() {
 
   pythonProcess.on('exit', (code, signal) => {
     pythonReady = false;
-    console.error(`Python stopped: code=${code}, signal=${signal}`);
+
+    console.error(
+      `Python stopped: code=${code}, signal=${signal}`
+    );
 
     if (!shuttingDown) {
-      console.error('Python API завершился. Перезапуск контейнера.');
+      console.error(
+        'Python API завершился. Перезапуск контейнера.'
+      );
+
       process.exit(1);
     }
   });
 }
 
-/* ================= PYTHON API PROXY ================= */
 
-/*
-  Все остальные /api/* маршруты идут в FastAPI.
-  Node-маршруты выше имеют приоритет.
-  Поток запроса/ответа сохраняется, включая Range для аудио.
-*/
+// Проверяем, что FastAPI действительно запустился
+function checkPythonHealth() {
+  return new Promise(resolve => {
+    const request = http.get(
+      {
+        hostname: PYTHON_HOST,
+        port: PYTHON_API_PORT,
+        path: '/api/health',
+        timeout: 2000
+      },
+      response => {
+        response.resume();
+
+        resolve(
+          response.statusCode >= 200 &&
+          response.statusCode < 300
+        );
+      }
+    );
+
+    request.on('error', () => resolve(false));
+
+    request.on('timeout', () => {
+      request.destroy();
+      resolve(false);
+    });
+  });
+}
+
+
+async function waitForPythonReady() {
+  const maxAttempts = 60;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (shuttingDown) {
+      throw new Error('Startup cancelled');
+    }
+
+    if (await checkPythonHealth()) {
+      pythonReady = true;
+      console.log('Python API успешно запущен');
+      return;
+    }
+
+    console.log(
+      `Ожидание Python API: ${attempt}/${maxAttempts}`
+    );
+
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+
+  throw new Error(
+    'Python API не запустился за 60 секунд. Проверь Docker logs.'
+  );
+}
+
+
+/* ================= PYTHON API PROXY ================= */
 
 function proxyToPython(req, res) {
   const options = {
@@ -662,20 +824,30 @@ function proxyToPython(req, res) {
     }
   };
 
-  const proxyRequest = http.request(options, proxyResponse => {
-    res.status(proxyResponse.statusCode || 502);
+  const proxyRequest = http.request(
+    options,
+    proxyResponse => {
+      res.status(
+        proxyResponse.statusCode || 502
+      );
 
-    for (const [key, value] of Object.entries(proxyResponse.headers)) {
-      if (value !== undefined) {
-        res.setHeader(key, value);
+      for (const [key, value] of Object.entries(
+        proxyResponse.headers
+      )) {
+        if (value !== undefined) {
+          res.setHeader(key, value);
+        }
       }
-    }
 
-    proxyResponse.pipe(res);
-  });
+      proxyResponse.pipe(res);
+    }
+  );
 
   proxyRequest.on('error', error => {
-    console.error('Python proxy error:', error.message);
+    console.error(
+      'Python proxy error:',
+      error.message
+    );
 
     if (!res.headersSent) {
       res.status(502).json({
@@ -696,72 +868,142 @@ function proxyToPython(req, res) {
   });
 }
 
-/* Статика сайта */
+
+/* ================= STATIC FILES ================= */
+
+// Не разрешаем скачивать внутренние файлы проекта
+app.use((req, res, next) => {
+  const blocked = [
+    /^\/api\.py$/i,
+    /^\/main\.py$/i,
+    /^\/package(?:-lock)?\.json$/i,
+    /^\/Dockerfile$/i,
+    /^\/\.dockerignore$/i,
+    /^\/requirements\.txt$/i,
+    /^\/server(?:\/|$)/i,
+    /^\/ru-backend(?:\/|$)/i,
+    /^\/node_modules(?:\/|$)/i
+  ];
+
+  if (blocked.some(pattern => pattern.test(req.path))) {
+    return res.sendStatus(404);
+  }
+
+  next();
+});
+
 app.use(express.static(ROOT, {
   index: 'index.html',
-  extensions: ['html']
+  extensions: ['html'],
+  dotfiles: 'ignore'
 }));
 
-/* OPTIONS для API */
+
+// OPTIONS для API
 app.options(/^\/api\/.*/, (_req, res) => {
   res.sendStatus(204);
 });
 
-/* Остальные API-маршруты обслуживает FastAPI */
+
+// Остальные API-маршруты обслуживает FastAPI
 app.use('/api', (req, res) => {
   proxyToPython(req, res);
 });
 
-/* Неизвестные страницы */
+
+// Неизвестные страницы
 app.use((req, res) => {
   if (req.path.startsWith('/api/')) {
-    return res.status(404).json({ error: 'api_route_not_found' });
+    return res.status(404).json({
+      error: 'api_route_not_found'
+    });
   }
 
   res.status(404).send('Страница не найдена');
 });
 
-/* ================= START / SHUTDOWN ================= */
 
-let httpServer = null;
-let shuttingDown = false;
+/* ================= START / SHUTDOWN ================= */
 
 async function start() {
   await pool.query('SELECT 1');
+
   console.log('Neon PostgreSQL connected');
 
   startPython();
 
+  // Дожидаемся запуска FastAPI
+  await waitForPythonReady();
+
   await bot.api.setMyCommands([
-    { command: 'start', description: 'Открыть EvuMusic' },
-    { command: 'app', description: 'Кнопка приложения' },
-    { command: 'search', description: 'Поиск трека' },
-    { command: 'invite', description: 'Создать инвайт' },
-    { command: 'help', description: 'Помощь' },
-    { command: 'stats', description: 'Статистика (админ)' }
+    {
+      command: 'start',
+      description: 'Открыть EvuMusic'
+    },
+    {
+      command: 'app',
+      description: 'Кнопка приложения'
+    },
+    {
+      command: 'search',
+      description: 'Поиск трека'
+    },
+    {
+      command: 'invite',
+      description: 'Создать инвайт'
+    },
+    {
+      command: 'help',
+      description: 'Помощь'
+    },
+    {
+      command: 'stats',
+      description: 'Статистика (админ)'
+    }
   ]);
 
   httpServer = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`EvuMusic server listening on port ${PORT}`);
+    console.log(
+      `EvuMusic server listening on port ${PORT}`
+    );
+
     console.log(`WebApp URL: ${WEBAPP_URL}`);
-    console.log(`Python API: http://${PYTHON_HOST}:${PYTHON_API_PORT}`);
+
+    console.log(
+      `Python API: http://${PYTHON_HOST}:${PYTHON_API_PORT}`
+    );
+
     console.log(`Python file: ${PYTHON_FILE}`);
 
     if (MUSIC_CHANNELS.length) {
-      console.log(`Music channels: ${MUSIC_CHANNELS.map(ch => '@' + ch).join(', ')}`);
+      console.log(
+        `Music channels: ${
+          MUSIC_CHANNELS.map(ch => '@' + ch).join(', ')
+        }`
+      );
     }
   });
 
   bot.start({
-    onStart: me => console.log(`Bot @${me.username} online`)
+    onStart: me => {
+      console.log(`Bot @${me.username} online`);
+    }
   }).catch(error => {
-    console.error('Telegram bot polling error:', error);
-    if (!shuttingDown) process.exit(1);
+    console.error(
+      'Telegram bot polling error:',
+      error
+    );
+
+    if (!shuttingDown) {
+      process.exit(1);
+    }
   });
 }
 
+
 async function shutdown(signal) {
   if (shuttingDown) return;
+
   shuttingDown = true;
 
   console.log(`Shutting down: ${signal}`);
@@ -773,7 +1015,9 @@ async function shutdown(signal) {
   }
 
   if (httpServer) {
-    await new Promise(resolve => httpServer.close(resolve));
+    await new Promise(resolve => {
+      httpServer.close(resolve);
+    });
   }
 
   if (pythonProcess && !pythonProcess.killed) {
@@ -783,14 +1027,24 @@ async function shutdown(signal) {
   try {
     await pool.end();
   } catch (error) {
-    console.error('PostgreSQL shutdown error:', error);
+    console.error(
+      'PostgreSQL shutdown error:',
+      error
+    );
   }
 
   process.exit(0);
 }
 
-process.once('SIGTERM', () => shutdown('SIGTERM'));
-process.once('SIGINT', () => shutdown('SIGINT'));
+
+process.once('SIGTERM', () => {
+  shutdown('SIGTERM');
+});
+
+process.once('SIGINT', () => {
+  shutdown('SIGINT');
+});
+
 
 start().catch(error => {
   console.error('EvuMusic startup failed:', error);
