@@ -16,7 +16,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Depends, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
-from fastapi.staticfiles import StaticFiles # ДОБАВЛЕНО ДЛЯ РАЗДАЧИ САЙТА
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -32,7 +32,7 @@ PROXY_SECRET = os.getenv("PROXY_SECRET", "evu-music-proxy-secret").encode()
 DEFAULT_SC_CLIENT_ID = "nIjtjiYnjkOhMyh5xrbqEW12DxeJVnic"
 SC_CLIENT_ID = (os.getenv("SC_CLIENT_ID", "") or DEFAULT_SC_CLIENT_ID).strip()
 SC_API = "https://api-v2.soundcloud.com"
-DEEZER_API = "https://api.deezer.com"
+ITUNES_API = "https://itunes.apple.com" # ЗАМЕНИЛИ DEEZER НА ITUNES
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 pool: Optional[asyncpg.Pool] = None
@@ -58,12 +58,8 @@ async def lifespan(app: FastAPI):
         print("[API] Shutdown complete")
 
 app = FastAPI(title="EvuMusic API", lifespan=lifespan)
-
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
     expose_headers=["Content-Length", "Content-Range", "Accept-Ranges", "Content-Type"],
 )
 
@@ -71,8 +67,7 @@ def get_http() -> httpx.AsyncClient:
     global _http
     if _http is None:
         _http = httpx.AsyncClient(
-            timeout=httpx.Timeout(30.0, connect=10.0),
-            follow_redirects=True,
+            timeout=httpx.Timeout(30.0, connect=10.0), follow_redirects=True,
             headers={"User-Agent": USER_AGENT, "Accept-Language": "ru-RU,ru;q=0.9"},
         )
     return _http
@@ -92,20 +87,16 @@ def verify_telegram_data(init_data: str) -> dict:
         calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(calculated_hash, received_hash):
             raise HTTPException(status_code=403, detail="Invalid Telegram auth data")
-        user_data = parsed_data.get("user")
-        if not user_data: raise HTTPException(status_code=403, detail="Telegram user data missing")
-        return json.loads(user_data)
+        return json.loads(parsed_data.get("user", "{}"))
     except Exception:
         raise HTTPException(status_code=403, detail="Invalid Telegram auth data")
 
 async def get_user_id(authorization: Optional[str] = Header(None)):
     user = verify_telegram_data(authorization)
-    user_id = user.get("id")
-    if not user_id: raise HTTPException(status_code=403, detail="Telegram user ID missing")
-    return int(user_id)
+    return int(user.get("id"))
 
 # ==========================================
-# БАЗА ДАННЫХ (Сохранения)
+# БАЗА ДАННЫХ
 # ==========================================
 class TrackData(BaseModel):
     id: str
@@ -190,17 +181,10 @@ def pack(t: dict) -> dict:
     cover = t.get("cover") or ""
     if cover: cover = "/api/cover/" + sign(cover)
     return {
-        "id": t["source"] + "_" + t["ext_id"],
-        "title": t["title"],
-        "artist": t["artist"],
-        "duration": t.get("duration", 0),
-        "dur": fmt_duration(t.get("duration", 0)),
-        "cover": cover,
-        "stream_url": stream,
-        "preview_url": stream,
-        "preview": stream,
-        "full": full,
-        "source": t["source"],
+        "id": t["source"] + "_" + t["ext_id"], "title": t["title"], "artist": t["artist"],
+        "duration": t.get("duration", 0), "dur": fmt_duration(t.get("duration", 0)),
+        "cover": cover, "stream_url": stream, "preview_url": stream, "preview": stream,
+        "full": full, "source": t["source"],
     }
 
 def rank(tracks: list, query: str) -> list:
@@ -208,9 +192,7 @@ def rank(tracks: list, query: str) -> list:
     q = (query or "").lower().strip()
     junk_re = re.compile(r"(cover|кавер|кувер|remix|ремикс|remake|караоке|karaoke|instrumental|инструментал|мини-?атюра|миниат|припев|ringtone|рингтон|reaction|реакция|live at|bootleg|\bминус(овка)?\b|\(live\b|\blive\)|radio ?edit)", re.I)
     def score(t):
-        title = t.get("title", "").lower()
-        artist = t.get("artist", "").lower()
-        hay = title + " " + artist
+        title = t.get("title", "").lower(); artist = t.get("artist", "").lower(); hay = title + " " + artist
         s = sum(2 for w in words if w in hay)
         if words and all(w in title for w in words): s += 10
         if q and (title.startswith(q) or hay.startswith(q)): s += 8
@@ -226,7 +208,7 @@ def rank(tracks: list, query: str) -> list:
     return tracks
 
 # ==========================================
-# ПОИСКОВИКИ
+# ПОИСКОВИКИ (Muzofond, SC, Yandex)
 # ==========================================
 _ITEM_SPLIT = re.compile(r'<li class="item" ')
 _DL_RE = re.compile(r'class="play" data-id="\d+" data-url="(https://dl[^"]+)"')
@@ -240,17 +222,12 @@ def _strip_tags(s: str) -> str:
 def parse_muzofond(html_text: str) -> list:
     out, by_url = [], {}
     for body in _ITEM_SPLIT.split(html_text)[1:]:
-        idm = re.match(r'data-id="(\d+)"', body)
-        dm = re.search(r'data-duration="(\d+)"', body)
-        urlm = _DL_RE.search(body)
+        idm = re.match(r'data-id="(\d+)"', body); dm = re.search(r'data-duration="(\d+)"', body); urlm = _DL_RE.search(body)
         if not (idm and urlm): continue
-        tm = _TRACK_RE.search(body)
-        am = _ARTIST_RE.search(body)
-        title = _strip_tags(tm.group(1)) if tm else ""
-        artist = _strip_tags(am.group(1)) if am else ""
+        tm = _TRACK_RE.search(body); am = _ARTIST_RE.search(body)
+        title = _strip_tags(tm.group(1)) if tm else ""; artist = _strip_tags(am.group(1)) if am else ""
         if not title: continue
-        img = _IMG_RE.search(body)
-        cover = ""
+        img = _IMG_RE.search(body); cover = ""
         if img and img.group(1).startswith("/"): cover = "https://muzofond.fm" + img.group(1)
         elif img: cover = img.group(1)
         item = {"ext_id": idm.group(1), "title": title, "artist": artist or "Неизвестен", "duration": int(dm.group(1)) if dm else 0, "cover": cover, "audio_url": urlm.group(1), "source": "muzofond"}
@@ -262,32 +239,23 @@ def parse_muzofond(html_text: str) -> list:
 async def muzofond_fetch(url: str) -> list:
     try:
         r = await get_http().get(url)
-        if r.status_code != 200: return []
-        return parse_muzofond(r.text)
+        return parse_muzofond(r.text) if r.status_code == 200 else []
     except Exception: return []
 
 async def muzofond_search(query: str, limit: int) -> list:
-    params_a = httpx.QueryParams({"q": query, "artist": "0"})
-    params_b = httpx.QueryParams({"q": query, "artist": "1"})
-    results = await asyncio.gather(
-        muzofond_fetch("https://muzofond.fm/music?" + str(params_a)),
-        muzofond_fetch("https://muzofond.fm/music?" + str(params_b)),
-        return_exceptions=True
-    )
+    params_a = httpx.QueryParams({"q": query, "artist": "0"}); params_b = httpx.QueryParams({"q": query, "artist": "1"})
+    results = await asyncio.gather(muzofond_fetch("https://muzofond.fm/music?" + str(params_a)), muzofond_fetch("https://muzofond.fm/music?" + str(params_b)), return_exceptions=True)
     merged, by_url = [], {}
     for res in results:
         if isinstance(res, Exception) or not res: continue
         for t in res:
-            key = t["audio_url"]
-            prev = by_url.get(key)
+            key = t["audio_url"]; prev = by_url.get(key)
             if prev is None: by_url[key] = t; merged.append(t)
             elif len(t["title"]) < len(prev["title"]): prev.update(t)
     return rank(merged, query)[:limit]
 
 def sc_params(**extra):
-    p = {"client_id": SC_CLIENT_ID}
-    p.update(extra)
-    return p
+    p = {"client_id": SC_CLIENT_ID}; p.update(extra); return p
 
 async def soundcloud_search(query: str, limit: int) -> list:
     if not ENABLE_SOUNDCLOUD: return []
@@ -301,20 +269,14 @@ async def soundcloud_search(query: str, limit: int) -> list:
         return out
     except Exception: return []
 
-_sc_cache = collections.OrderedDict()
-SC_CACHE_SIZE = 10
-
+_sc_cache = collections.OrderedDict(); SC_CACHE_SIZE = 10
 async def soundcloud_stream_bytes(sc_id: str) -> bytes:
-    if sc_id in _sc_cache:
-        _sc_cache.move_to_end(sc_id)
-        return _sc_cache[sc_id]
-    cli = get_http()
-    r = await cli.get(SC_API + "/tracks/" + sc_id, params=sc_params())
+    if sc_id in _sc_cache: _sc_cache.move_to_end(sc_id); return _sc_cache[sc_id]
+    cli = get_http(); r = await cli.get(SC_API + "/tracks/" + sc_id, params=sc_params())
     if r.status_code != 200: raise HTTPException(status_code=404, detail="SoundCloud track not found")
-    t = r.json()
-    trans = (t.get("media") or {}).get("transcodings") or []
+    t = r.json(); trans = (t.get("media") or {}).get("transcodings") or []
     frag = [x for x in trans if "aac_160k" in (x.get("preset") or "")] or [x for x in trans if x.get("format", {}).get("protocol") == "hls"]
-    if not frag: raise HTTPException(status_code=502, detail="No HLS stream for this track")
+    if not frag: raise HTTPException(status_code=502, detail="No HLS stream")
     loc = None
     for x in frag:
         rl = await cli.get(x["url"], params=sc_params())
@@ -324,8 +286,7 @@ async def soundcloud_stream_bytes(sc_id: str) -> bytes:
     if not loc: raise HTTPException(status_code=502, detail="Playlist resolve failed")
     pl = await cli.get(loc)
     if pl.status_code != 200: raise HTTPException(status_code=502, detail="Playlist fetch failed")
-    text = pl.text
-    init_m = re.search(r'#EXT-X-MAP:URI="([^"]+)"', text)
+    text = pl.text; init_m = re.search(r'#EXT-X-MAP:URI="([^"]+)"', text)
     segs = [ln.strip() for ln in text.splitlines() if ln and not ln.startswith("#")]
     if not segs: raise HTTPException(status_code=502, detail="Empty playlist")
     blob = bytearray()
@@ -337,7 +298,6 @@ async def soundcloud_stream_bytes(sc_id: str) -> bytes:
         if rs.status_code != 200: break
         blob += rs.content
     data = bytes(blob)
-    if len(data) < 2048: raise HTTPException(status_code=502, detail="Stream assemble failed")
     _sc_cache[sc_id] = data
     while len(_sc_cache) > SC_CACHE_SIZE: _sc_cache.popitem(last=False)
     return data
@@ -348,8 +308,7 @@ def get_ym():
     if _ym_client is None:
         try:
             from yandex_music import Client
-            _ym_client = Client(YM_TOKEN) if YM_TOKEN else Client()
-            _ym_client.init()
+            _ym_client = Client(YM_TOKEN) if YM_TOKEN else Client(); _ym_client.init()
         except Exception: return None
     return _ym_client
 
@@ -384,7 +343,6 @@ async def search(q: Optional[str] = Query(None), query: Optional[str] = Query(No
         if ENABLE_MUZOFOND: tasks.append(muzofond_search(term, limit))
         if ENABLE_YANDEX: tasks.append(yandex_search(term, limit))
         if ENABLE_SOUNDCLOUD: tasks.append(soundcloud_search(term, limit))
-        if not tasks: return {"tracks": []}
         results = await asyncio.gather(*tasks, return_exceptions=True)
         merged, seen = [], set()
         for res in results:
@@ -392,59 +350,75 @@ async def search(q: Optional[str] = Query(None), query: Optional[str] = Query(No
             for t in res:
                 key = (str(t.get("artist") or "").lower(), str(t.get("title") or "").lower())
                 if key in seen: continue
-                seen.add(key)
-                merged.append(t)
+                seen.add(key); merged.append(t)
         merged = rank(merged, term)[:limit]
         return {"tracks": [pack(t) for t in merged]}
     except Exception: return {"tracks": []}
 
+# ==========================================
+# АЛЬБОМЫ И ОБЛОЖКИ (ТЕПЕРЬ ITUNES)
+# ==========================================
 @app.get("/api/search/albums")
 async def search_albums(q: Optional[str] = Query(None), query: Optional[str] = Query(None), limit: int = Query(30, ge=1, le=50)):
     term = norm(q or query or "")
     if not term: return {"albums": []}
     try:
-        r = await get_http().get(DEEZER_API + "/search/album", params={"q": term, "limit": limit})
+        r = await get_http().get(ITUNES_API + "/search", params={"term": term, "entity": "album", "limit": limit})
         if r.status_code != 200: return {"albums": []}
         data = r.json()
         albums = []
-        for album in data.get("data", []):
+        for album in data.get("results", []):
+            cover = album.get("artworkUrl100", "").replace("100x100bb", "600x600bb")
             albums.append({
-                "id": str(album.get("id", "")),
-                "title": album.get("title", ""),
-                "artist": (album.get("artist") or {}).get("name", "Неизвестен"),
-                "cover": album.get("cover_xl") or album.get("cover_big") or album.get("cover") or "",
-                "track_count": album.get("nb_tracks", 0),
-                "release_date": album.get("release_date", ""),
-                "source": "deezer",
+                "id": str(album.get("collectionId", "")),
+                "title": album.get("collectionName", ""),
+                "artist": album.get("artistName", "Неизвестен"),
+                "cover": cover,
+                "track_count": album.get("trackCount", 0),
+                "release_date": album.get("releaseDate", "")[:10],
+                "source": "itunes",
             })
         return {"albums": albums}
     except Exception: return {"albums": []}
 
-@app.get("/api/deezer/album/{album_id}")
-async def get_deezer_album(album_id: str):
+@app.get("/api/deezer/album/{album_id}") # Оставил путь прежним, чтобы фронтенд не сломался
+async def get_album(album_id: str):
     if not album_id.isdigit(): raise HTTPException(status_code=400, detail="Invalid album ID")
     try:
-        r = await get_http().get(DEEZER_API + "/album/" + album_id)
-        if r.status_code != 200: raise HTTPException(status_code=502, detail="Deezer request failed")
-        album = r.json()
-        if album.get("error"): raise HTTPException(status_code=404, detail="Album not found")
+        r = await get_http().get(ITUNES_API + "/lookup", params={"id": album_id, "entity": "song"})
+        if r.status_code != 200: raise HTTPException(status_code=502, detail="iTunes request failed")
+        data = r.json().get("results", [])
+        
+        if not data: raise HTTPException(status_code=404, detail="Album not found")
+        
+        album_info = data[0] # Первый элемент - сам альбом
         tracks = []
-        for t in (album.get("tracks") or {}).get("data", []):
+        for t in data[1:]: # Остальные - треки
+            cover = t.get("artworkUrl100", "").replace("100x100bb", "600x600bb")
             tracks.append({
-                "id": str(t.get("id", "")),
-                "title": t.get("title", ""),
-                "artist": (t.get("artist") or {}).get("name", "Неизвестен"),
-                "duration": t.get("duration", 0),
-                "dur": fmt_duration(t.get("duration", 0)),
-                "cover": album.get("cover_xl") or album.get("cover_big") or "",
-                "preview": t.get("preview", ""),
-                "preview_url": t.get("preview", ""),
-                "stream_url": t.get("preview", ""),
-                "source": "deezer",
+                "id": str(t.get("trackId", "")),
+                "title": t.get("trackName", ""),
+                "artist": t.get("artistName", "Неизвестен"),
+                "duration": (t.get("trackTimeMillis") or 0) // 1000,
+                "dur": fmt_duration((t.get("trackTimeMillis") or 0) // 1000),
+                "cover": cover,
+                "preview": t.get("previewUrl", ""),
+                "preview_url": t.get("previewUrl", ""),
+                "stream_url": t.get("previewUrl", ""),
+                "source": "itunes",
                 "full": False,
             })
-        return {"album": album, "tracks": tracks}
-    except Exception: raise HTTPException(status_code=502, detail="Could not load Deezer album")
+            
+        return {
+            "album": {
+                "id": str(album_info.get("collectionId", "")),
+                "title": album_info.get("collectionName", ""),
+                "artist": album_info.get("artistName", ""),
+                "cover": album_info.get("artworkUrl100", "").replace("100x100bb", "600x600bb")
+            },
+            "tracks": tracks
+        }
+    except Exception: raise HTTPException(status_code=502, detail="Could not load album")
 
 @app.get("/api/track-cover")
 async def get_track_cover(title: str = Query(...), artist: str = Query("")):
@@ -452,12 +426,11 @@ async def get_track_cover(title: str = Query(...), artist: str = Query("")):
     if not title: return {"cover": ""}
     search_query = f"{artist} {title}" if artist else title
     try:
-        r = await get_http().get(DEEZER_API + "/search", params={"q": search_query, "limit": 5})
+        r = await get_http().get(ITUNES_API + "/search", params={"term": search_query, "entity": "song", "limit": 1})
         if r.status_code != 200: return {"cover": ""}
-        tracks = r.json().get("data", [])
+        tracks = r.json().get("results", [])
         if not tracks: return {"cover": ""}
-        best = tracks[0]
-        cover_url = (best.get("album") or {}).get("cover_xl") or (best.get("album") or {}).get("cover_big") or ""
+        cover_url = tracks[0].get("artworkUrl100", "").replace("100x100bb", "600x600bb")
         return {"cover": cover_url}
     except Exception: return {"cover": ""}
 
@@ -466,21 +439,15 @@ async def get_track_cover(title: str = Query(...), artist: str = Query("")):
 # ==========================================
 @app.api_route("/api/stream/{token}", methods=["GET", "HEAD", "OPTIONS"])
 async def stream(token: str, request: Request):
-    url = unsign(token)
-    headers = {"Range": request.headers["range"]} if request.headers.get("range") else {}
+    url = unsign(token); headers = {"Range": request.headers["range"]} if request.headers.get("range") else {}
     try:
-        req = get_http().build_request("GET", url, headers=headers)
-        upstream = await get_http().send(req, stream=True)
+        req = get_http().build_request("GET", url, headers=headers); upstream = await get_http().send(req, stream=True)
     except Exception as e: raise HTTPException(status_code=502, detail=f"Proxy error: {e}")
     out_headers = {"Content-Type": upstream.headers.get("content-type", "audio/mpeg"), "Accept-Ranges": "bytes", "Access-Control-Allow-Origin": "*"}
     for h in ("Content-Length", "Content-Range"):
         if h in upstream.headers: out_headers[h] = upstream.headers[h]
-    if upstream.status_code >= 400:
-        await upstream.aclose()
-        raise HTTPException(status_code=502, detail="Upstream error")
-    if request.method == "HEAD":
-        await upstream.aclose()
-        return Response(status_code=upstream.status_code, headers=out_headers)
+    if upstream.status_code >= 400: await upstream.aclose(); raise HTTPException(status_code=502, detail="Upstream error")
+    if request.method == "HEAD": await upstream.aclose(); return Response(status_code=upstream.status_code, headers=out_headers)
     async def gen():
         try:
             async for chunk in upstream.aiter_raw(65536): yield chunk
@@ -509,8 +476,7 @@ async def yandex_audio(ym_id: str, request: Request):
     try: link = await asyncio.to_thread(resolve)
     except Exception as e: raise HTTPException(status_code=502, detail=str(e))
     headers = {"Range": request.headers["range"]} if request.headers.get("range") else {}
-    req = get_http().build_request("GET", link, headers=headers)
-    upstream = await get_http().send(req, stream=True)
+    req = get_http().build_request("GET", link, headers=headers); upstream = await get_http().send(req, stream=True)
     out_headers = {"Content-Type": "audio/mpeg", "Accept-Ranges": "bytes", "Access-Control-Allow-Origin": "*"}
     for h in ("Content-Length", "Content-Range"):
         if h in upstream.headers: out_headers[h] = upstream.headers[h]
@@ -530,7 +496,6 @@ async def cover(token: str):
     return Response(content=r.content, media_type=r.headers.get("content-type", "image/jpeg"), headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=86400"})
 
 # ==========================================
-# РАЗДАЧА САЙТА (ГЛАВНОЕ!)
+# РАЗДАЧА САЙТА
 # ==========================================
-# Этот блок должен быть строго в самом конце, после всех @app.get!
 app.mount("/", StaticFiles(directory=".", html=True), name="static")
