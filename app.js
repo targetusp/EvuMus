@@ -18,7 +18,6 @@
   var THEME_KEY = 'evu_theme';
   var ALBUM_KEY = 'evu_albums_v1';
   var LANG_KEY = 'evu_language';
-  var GLASS_KEY = 'evu_glass_mode';
 
   var THEME_NAMES = { blue: 'Синяя', white: 'Белая', black: 'Чёрная' };
   
@@ -42,7 +41,6 @@
 
   var mymusicTab = 'all';
   var searchTab = 'tracks';
-  var favTab = 'fav';
 
   var trackRegistry = {};
   var searchTimer = null;
@@ -67,7 +65,7 @@
       var data = await res.json();
       favs = data.favorites || []; library = data.library || []; playlists = data.playlists || [];
       favs.forEach(registerTrack); library.forEach(registerTrack); playlists.forEach(function(p) { if(p.tracks) p.tracks.forEach(registerTrack); });
-      refreshAll(); renderPlaylists(); favTitle();
+      refreshAll(); renderPlaylists(); 
     } catch (e) { console.error(e); }
   }
 
@@ -111,49 +109,10 @@
     theme = name; document.documentElement.setAttribute('data-theme', name);
     var meta = document.querySelector('meta[name=theme-color]'); if(meta) meta.setAttribute('content', name === 'white' ? '#ffffff' : name === 'black' ? '#000000' : '#0b1622');
     var tv = $('#themeValue'); if (tv) tv.textContent = THEME_NAMES[name] || name;
-    document.documentElement.classList.toggle('glass-mode', !!load(GLASS_KEY, false));
     $$('.theme-option').forEach(function (b) { b.classList.toggle('selected', b.getAttribute('data-theme-pick') === name); });
     save(THEME_KEY, name);
   }
   applyTheme(theme);
-  var glassToggle = $('#glassModeToggle'); if (glassToggle) {
-      glassToggle.checked = !!load(GLASS_KEY, false);
-      glassToggle.addEventListener('change', function () { save(GLASS_KEY, this.checked); document.documentElement.classList.toggle('glass-mode', this.checked); });
-  }
-
-  // ===== I18N =====
-  var I18N = {
-    ru: {my:'Моя музыка',search:'Поиск',favorites:'Любимое',playlists:'Плейлисты',albums:'Альбомы',settings:'Настройки',channel:'Канал с обновлениями',all:'Все треки',tracks:'Треки',searchMusic:'Поиск музыки',searchHint:'Находи свои треки и новую музыку',searchPlaceholder:'Название песни или исполнитель...',advanced:'Расширенный поиск',collection:'Твоя коллекция',noTracks:'Здесь пока нет треков',addMusic:'Добавляй музыку из поиска и собирай свои плейлисты.',goSearch:'Перейти к поиску',theme:'Оформление',language:'Язык',general:'Основное',support:'Связь и поддержка',feedback:'Обратная связь',help:'Помочь проекту',account:'Аккаунт',delete:'Удалить личный кабинет',create:'Создать',newAlbum:'Новый альбом',albumHint:'Собирай треки в собственные альбомы'},
-    en: {my:'My music',search:'Search',favorites:'Favorites',playlists:'Playlists',albums:'Albums',settings:'Settings',channel:'Updates channel',all:'All tracks',tracks:'Tracks',searchMusic:'Music search',searchHint:'Find your tracks and discover new music',searchPlaceholder:'Song title or artist...',advanced:'Advanced search',collection:'Your collection',noTracks:'No tracks yet',addMusic:'Add music from search and build your playlists.',goSearch:'Go to search',theme:'Appearance',language:'Language',general:'General',support:'Help & support',feedback:'Feedback',help:'Support the project',account:'Account',delete:'Delete account',create:'Create',newAlbum:'New album',albumHint:'Collect tracks in your own albums'}
-  };
-  function applyLanguage(code) {
-    language = I18N[code] ? code : 'ru'; var d = I18N[language]; document.documentElement.lang = language;
-    var nav = $$('.nav__item[data-page]'); var navKeys = ['my','search','favorites','playlists','albums','settings'];
-    nav.forEach(function (el, i) { var span = el.querySelector('span:not(.nav__badge)'); if (span && d[navKeys[i]]) span.textContent = d[navKeys[i]]; });
-    var link = $('.nav__item--link span'); if (link) link.textContent = d.channel;
-    var setText = function (sel, val) { var el = $(sel); if (el && val) el.textContent = val; };
-    setText('#page-mymusic .section-head h2', d.my); setText('#page-search .section-head h2', d.searchMusic);
-    setText('#page-search .section-sub', d.searchHint); setText('#page-mymusic .empty-card h3', d.noTracks);
-    setText('#page-mymusic .empty-card p', d.addMusic); setText('#page-mymusic .empty-card .btn-primary', d.goSearch);
-    setText('#collectionHead h2', d.collection); setText('#page-playlists .section-head h2', d.playlists);
-    setText('#page-albums .section-head h2', d.albums); setText('.album-sub', d.albumHint);
-    setText('#page-settings .page-title', d.settings); setText('#page-settings .settings-label', d.general);
-    setText('#openThemeModal .settings-item__title', d.theme); setText('#btnLang .settings-item__title', d.language);
-    setText('#btnFeedback .settings-item__title', d.feedback); setText('#page-settings .settings-label:nth-of-type(2)', d.support);
-    setText('#page-settings .settings-label:nth-of-type(3)', d.account); setText('#btnDelete .settings-item__title', d.delete);
-    setText('#btnCreatePlaylist', d.create); setText('#btnCreateAlbum', '＋ ' + d.create);
-    var input = $('#searchInput'); if (input) input.placeholder = d.searchPlaceholder;
-    $$('.tab[data-mymusic-tab]').forEach(function (el) { el.textContent = el.dataset.mymusicTab === 'all' ? d.all : d.favorites; });
-    $$('.tab[data-search-tab]').forEach(function (el) { el.textContent = el.dataset.searchTab === 'tracks' ? d.tracks : d.albums; });
-    $$('.language-option').forEach(function (el) { el.classList.toggle('selected', el.dataset.lang === language); });
-    var langValue = $('#btnLang .settings-item__value'); if (langValue) langValue.textContent = ({ru:'Русский',en:'English'})[language];
-    save(LANG_KEY, language);
-  }
-  var btnLang = $('#btnLang'); if(btnLang) btnLang.addEventListener('click', function () { var m = $('#languageModal'); if(m) m.hidden = false; });
-  var closeLang = $('#closeLanguageModal'); if(closeLang) closeLang.addEventListener('click', function () { var m = $('#languageModal'); if(m) m.hidden = true; });
-  var langModal = $('#languageModal'); if(langModal) langModal.addEventListener('click', function (e) { if (e.target === langModal) langModal.hidden = true; });
-  $$('.language-option').forEach(function (el) { el.addEventListener('click', function () { applyLanguage(el.dataset.lang); }); });
-  applyLanguage(language);
 
   // ===== Навигация =====
   (function installSupportBannerOnPages() {
@@ -176,7 +135,6 @@
   }
   bindTabs('[data-mymusic-tab]', 'data-mymusic-tab', function (v) { mymusicTab = v; renderMyMusic(); });
   bindTabs('[data-search-tab]', 'data-search-tab', function (v) { searchTab = v; renderSearch(); });
-  bindTabs('[data-fav-tab]', 'data-fav-tab', function (v) { favTab = v; favTitle(); renderFavs(); });
 
   function registerTrack(t) { if (!t || t.id == null) return t; trackRegistry[String(t.id)] = t; return t; }
 
@@ -260,9 +218,18 @@
   function renderList(container, tracks) { if (!container) return; container.innerHTML = tracks.map(trackHTML).join(''); hydrateTrackCovers(container); updateRowPlayState(); }
 
   // ===== Страницы =====
-  function renderMyMusic() { var tracks = library; var el = $('#myEmpty'); if(el) el.hidden = tracks.length > 0; var c = $('#myCount'); if(c) c.textContent = 'Треков: ' + tracks.length; renderList($('#myList'), tracks); }
-  function favTitle() { var el = $('#favTitle'); if (el) el.textContent = favTab === 'fav' ? 'Любимое' : 'Моя музыка'; }
-  function renderFavs() { var tracks = favs; var el = $('#favEmpty'); if(el) el.hidden = tracks.length > 0; var c = $('#favCount'); if(c) c.textContent = 'Треков: ' + tracks.length; renderList($('#favList'), tracks); var b = $('#favBadge'); if(b) b.textContent = favs.length; }
+  
+  // ОБЪЕДИНЕННАЯ МОЯ МУЗЫКА (Все треки / Любимое)
+  function renderMyMusic() { 
+    var tracks = (mymusicTab === 'all') ? library : favs; 
+    var title = (mymusicTab === 'all') ? 'Моя музыка' : 'Любимое';
+    
+    var titleEl = $('#myPageTitle'); if (titleEl) titleEl.textContent = title;
+    var el = $('#myEmpty'); if(el) el.hidden = tracks.length > 0; 
+    var c = $('#myCount'); if(c) c.textContent = 'Треков: ' + tracks.length; 
+    renderList($('#myList'), tracks); 
+  }
+
   function renderCollection() { var tracks = library; var el = $('#collEmpty'); if(el) el.hidden = tracks.length > 0; var c = $('#collCount'); if(c) c.textContent = 'Треков: ' + tracks.length; renderList($('#collList'), tracks); }
 
   function renderSearch() {
@@ -305,7 +272,8 @@
   function openAlbumTracks(albumId) {
     var results = $('#searchResults'); var empty = $('#searchEmpty');
     if(results) results.innerHTML = '<div class="search-hint">Загружаю альбом…</div>'; if(empty) empty.hidden = true;
-    fetch(API_URL + '/api/deezer/album/' + encodeURIComponent(albumId)).then(function(r) { return r.json(); }).then(function(data) {
+    // ИСПРАВЛЕНО: /api/deezer/album/ заменен на /api/itunes/album/
+    fetch(API_URL + '/api/itunes/album/' + encodeURIComponent(albumId)).then(function(r) { return r.json(); }).then(function(data) {
       var tracks = (data.tracks || []).map(function(t) {
         var track = { id: 'itunes_' + t.id, title: t.title || 'Без названия', artist: t.artist || '', dur: t.dur || '', cover: absUrl(t.cover || ''), preview: t.preview || '', full: false, source: 'itunes' };
         registerTrack(track); return track;
@@ -376,7 +344,7 @@
     else if (btn.classList.contains('js-addpl')) { if (!tr) return; openAddToPlaylist(id); }
   });
 
-  function refreshAll() { renderMyMusic(); renderFavs(); renderSearch(); }
+  function refreshAll() { renderMyMusic(); renderSearch(); }
 
   function renderPlaylists() {
     var grid = $('#playlistGrid'); if (!grid) return; var html = '';
@@ -498,5 +466,5 @@
   var closeBtn = $('#playerClose'); if (closeBtn) closeBtn.addEventListener('click', function () { stopPreview(); playerState.playing = false; var pc = $('#playerContainer'); if(pc) pc.hidden = true; var pl = $('#player'); if(pl) pl.hidden = true; var pr = $('#playerProgress'); if(pr) pr.style.width = '0%'; });
 
   // ===== Init =====
-  renderPlaylists(); renderAlbums(); loadUserData(); favTitle();
+  renderPlaylists(); renderAlbums(); loadUserData();
 })();
