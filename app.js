@@ -3,6 +3,9 @@
 
   var API_URL = ''; 
 
+  // ===== РАЗБУДИТЬ СЕРВЕР ПРИ СТАРТЕ =====
+  fetch(API_URL + '/api/health').catch(function(){});
+
   var pcInit = document.getElementById('playerContainer'); if (pcInit) pcInit.hidden = true;
   var plInit = document.getElementById('player'); if (plInit) plInit.hidden = true;
 
@@ -187,7 +190,7 @@
     });
   }
 
-  // ВОССТАНОВЛЕНИЕ ПРЕВЬЮ
+  // ===== ВОССТАНОВЛЕНИЕ ПРЕВЬЮ =====
   async function restorePreview(tr) {
     if (tr.preview) return true;
     toast('Восстанавливаю ссылку...');
@@ -199,14 +202,13 @@
           tr.preview = newTrack.preview;
           tr.cover = newTrack.cover;
           tr.source = newTrack.source;
-          tr.id = newTrack.id; // Обновляем ID на актуальный
+          tr.id = newTrack.id; 
           
           await fetch(API_URL + '/api/update_preview', {
               method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, getAuthHeader()),
               body: JSON.stringify({ id: String(tr.id), title: tr.title, artist: tr.artist, preview: tr.preview })
           });
           
-          // Обновляем в локальных массивах
           trackRegistry[tr.id] = tr;
           return true;
       }
@@ -283,7 +285,28 @@
       '</div></div>';
   }
 
-  function renderList(container, tracks) { if (!container) return; container.innerHTML = tracks.map(trackHTML).join(''); hydrateTrackCovers(container); updateRowPlayState(); }
+  // === ПРЕДЗАГРУЗКА АУДИО ===
+  var preloadedAudios = {};
+
+  function preloadAudio(url) {
+    if (!url || preloadedAudios[url]) return;
+    var audio = new Audio();
+    audio.preload = 'auto';
+    audio.src = url;
+    preloadedAudios[url] = audio;
+  }
+
+  function renderList(container, tracks) { 
+    if (!container) return; 
+    container.innerHTML = tracks.map(trackHTML).join(''); 
+    hydrateTrackCovers(container); 
+    updateRowPlayState(); 
+
+    // Начинаем качать первые 5 треков в фоне
+    tracks.slice(0, 5).forEach(function(t) {
+      if (t.preview) preloadAudio(t.preview);
+    });
+  }
 
   // ===== Страницы =====
   function renderMyMusic() { 
@@ -397,7 +420,6 @@
   async function triggerPlay(row) {
     if (!row) return; var id = row.getAttribute('data-id'); var tr = findTrack(id); if (!tr) return;
     
-    // ПЫТАЕМСЯ ВОССТАНОВИТЬ ПРЕВЬЮ, ЕСЛИ ЕГО НЕТ
     if (!tr.preview) {
         var restored = await restorePreview(tr);
         if (!restored) return;
@@ -535,10 +557,23 @@
 
   function startAudio(url, t) {
     if (previewAudio) { previewAudio.pause(); previewAudio = null; }
-    previewTrackId = String(t.id); previewAudio = new Audio(url);
-    previewAudio.preload = 'auto'; previewAudio.crossOrigin = 'anonymous'; previewAudio.volume = volume / 100; previewAudio.currentTime = 0; previewAudio.load();
+    previewTrackId = String(t.id); 
+    
+    // ИСПОЛЬЗУЕМ ПРЕДЗАГРУЖЕННЫЙ ОБЪЕКТ
+    if (preloadedAudios[url]) {
+        previewAudio = preloadedAudios[url];
+        previewAudio.currentTime = 0;
+    } else {
+        previewAudio = new Audio(url);
+        previewAudio.preload = 'auto'; 
+        previewAudio.crossOrigin = 'anonymous'; 
+        previewAudio.load();
+    }
+    
+    previewAudio.volume = volume / 100; 
     var playPromise = previewAudio.play(); if (playPromise && playPromise.catch) playPromise.catch(function () {});
     showPlayer(t); setPlayingUI(true);
+    
     previewAudio.ontimeupdate = function () { if (previewAudio && !seekDrag) { var dur = (previewAudio.duration && isFinite(previewAudio.duration) && previewAudio.duration > 0) ? previewAudio.duration : 30; var p = $('#playerProgress'); if(p) p.style.width = Math.min(100, (previewAudio.currentTime / dur * 100)) + '%'; } };
     previewAudio.onended = function () { var p = $('#playerProgress'); if(p) p.style.width = '0%'; var idx = queueIds.indexOf(previewTrackId); if (idx >= 0 && idx < queueIds.length - 1) { var nextT = (trackRegistry[queueIds[idx + 1]] || findTrack(queueIds[idx + 1])); if (nextT && nextT.preview) { playPreview(nextT); return; } } setPlayingUI(false); };
     previewAudio.onplay = function () { setPlayingUI(true); }; previewAudio.onpause = function () { setPlayingUI(false); };
