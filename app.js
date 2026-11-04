@@ -1,823 +1,462 @@
-(function () {
-  'use strict';
-
-  // ===== Конфигурация =====
-  var API_URL = 'https://evumus.onrender.com'; 
-  var BACKEND_URL = 'https://evumus.onrender.com'; // Если поиск музыки работает на этом же сервере
-
-  // ===== Telegram SDK =====
-  var TG = window.Telegram && window.Telegram.WebApp;
-  if (TG) {
-    try { TG.ready(); TG.expand(); TG.setHeaderColor && TG.setHeaderColor('#0e1a27'); } catch (e) {}
-    document.getElementById('tgHeader').style.display = 'none';
-    document.body.classList.add('telegram-mode');
-  }
-
-  // ===== Состояние =====
-  var THEME_KEY = 'evu_theme';
-  var ALBUM_KEY = 'evu_albums_v1';
-  var LANG_KEY = 'evu_language';
-  var GLASS_KEY = 'evu_glass_mode';
-
-  var THEME_NAMES = { blue: 'Синяя', white: 'Белая', black: 'Чёрная' };
-  
-  // Данные, которые загружаются с сервера
-  var library = [];
-  var favs = [];
-  var playlists = [];
-  
-  // Локальные данные
-  var albums = load(ALBUM_KEY, []);
-  var language = load(LANG_KEY, 'ru');
-  var activeAlbumIdx = null;
-  var COVER_COLORS = ['#e85d75','#6c8ee0','#5bb98c','#d4a04c','#9b6dd6','#e07850','#4cb5d4','#d45c9e','#7bc65a','#c05a5a','#5a7bd4','#b8a04c','#8c6ce0','#4cc0a8','#d47898'];
-
-  function load(key, fallback) {
-    try { var v = JSON.parse(localStorage.getItem(key)); return v == null ? fallback : v; }
-    catch (e) { return fallback; }
-  }
-  function save(key, val) { localStorage.setItem(key, JSON.stringify(val)); }
-
-  var theme = load(THEME_KEY, 'blue');
-  if (!Array.isArray(albums)) albums = [];
-
-  var mymusicTab = 'all';
-  var searchTab = 'tracks';
-  var favTab = 'fav';
-
-  var trackRegistry = {};
-  var searchTimer = null;
-  var searchRequestId = 0;   
-
-  var $ = function (s) { return document.querySelector(s); };
-  var $$ = function (s) { return Array.prototype.slice.call(document.querySelectorAll(s)); };
-
-  function esc(s) {
-    return String(s).replace(/[&<>"']/g, function (c) {
-      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
-    });
-  }
-
-  function coverColor(n) { return COVER_COLORS[(n || 0) % COVER_COLORS.length]; }
-  function coverLetter(t) { return (t || '?').charAt(0).toUpperCase(); }
-
-  function toast(msg) {
-    var el = $('#toast');
-    el.textContent = msg;
-    el.hidden = false;
-    clearTimeout(el._t);
-    el._t = setTimeout(function () { el.hidden = true; }, 2200);
-  }
-
-  // ===== API Запросы (Neon) =====
-  function getAuthHeader() {
-    if (!TG || !TG.initData) return {};
-    return { 'Authorization': TG.initData };
-  }
-
-  async function loadUserData() {
-    if (!TG || !TG.initData) return;
-    try {
-      var res = await fetch(API_URL + '/api/user_data', { headers: getAuthHeader() });
-      if (!res.ok) throw new Error('Auth failed');
-      
-      var data = await res.json();
-      favs = data.favorites || [];
-      library = data.library || [];
-      playlists = data.playlists || [];
-      
-      favs.forEach(registerTrack);
-      library.forEach(registerTrack);
-      playlists.forEach(function(p) { if(p.tracks) p.tracks.forEach(registerTrack); });
-
-      refreshAll();
-      renderPlaylists();
-      favTitle();
-    } catch (e) {
-      console.error(e);
-      toast('Ошибка синхронизации');
-    }
-  }
-
-  async function apiToggleFav(tr) {
-    try {
-      var res = await fetch(API_URL + '/api/favorites', {
-        method: 'POST',
-        headers: Object.assign({ 'Content-Type': 'application/json' }, getAuthHeader()),
-        body: JSON.stringify({ 
-            id: String(tr.id), title: tr.title, artist: tr.artist, 
-            duration: tr.dur || '', cover: tr.cover || '', source: tr.source || '' 
-        })
-      });
-      if (!res.ok) throw new Error();
-      
-      var data = await res.json();
-      if (data.status === 'added') {
-        favs.push(tr);
-        toast('Добавлено в любимое');
-      } else {
-        favs = favs.filter(function(f) { return String(f.id) !== String(tr.id); });
-        toast('Убрано из любимого');
-      }
-      refreshAll();
-    } catch (e) {
-      toast('Ошибка сохранения');
-    }
-  }
-
-  async function apiCreatePlaylist(name) {
-    try {
-      var res = await fetch(API_URL + '/api/playlists', {
-        method: 'POST',
-        headers: Object.assign({ 'Content-Type': 'application/json' }, getAuthHeader()),
-        body: JSON.stringify({ title: name })
-      });
-      if (!res.ok) throw new Error();
-      return await res.json();
-    } catch (e) {
-      toast('Ошибка создания');
-      return null;
-    }
-  }
-
-  async function apiAddTrackToPlaylist(playlistId, tr) {
-    try {
-      var res = await fetch(API_URL + '/api/playlists/add_track', {
-        method: 'POST',
-        headers: Object.assign({ 'Content-Type': 'application/json' }, getAuthHeader()),
-        body: JSON.stringify({ 
-            playlist_id: playlistId, id: String(tr.id), title: tr.title, 
-            artist: tr.artist, duration: tr.dur || '', cover: tr.cover || '', source: tr.source || '' 
-        })
-      });
-      return res.ok;
-    } catch (e) {
-      return false;
-    }
-  }
-
-  // ===== Тема =====
-  function applyTheme(name) {
-    theme = name;
-    document.documentElement.setAttribute('data-theme', name);
-    document.querySelector('meta[name=theme-color]').setAttribute('content',
-      name === 'white' ? '#ffffff' : name === 'black' ? '#000000' : '#0b1622');
-    $('#themeValue').textContent = THEME_NAMES[name] || name;
-    document.documentElement.classList.toggle('glass-mode', !!load(GLASS_KEY, false));
-    $$('.theme-option').forEach(function (b) {
-      b.classList.toggle('selected', b.getAttribute('data-theme-pick') === name);
-    });
-    save(THEME_KEY, name);
-  }
-  applyTheme(theme);
-  $('#glassModeToggle').checked = !!load(GLASS_KEY, false);
-  $('#glassModeToggle').addEventListener('change', function () {
-    save(GLASS_KEY, this.checked);
-    document.documentElement.classList.toggle('glass-mode', this.checked);
-  });
-
-  // ===== Языки (I18N) =====
-  var I18N = {
-    ru: {my:'Моя музыка',search:'Поиск',favorites:'Любимое',playlists:'Плейлисты',albums:'Альбомы',settings:'Настройки',channel:'Канал с обновлениями',all:'Все треки',tracks:'Треки',searchMusic:'Поиск музыки',searchHint:'Находи свои треки и новую музыку',searchPlaceholder:'Название песни или исполнитель...',advanced:'Расширенный поиск',collection:'Твоя коллекция',noTracks:'Здесь пока нет треков',addMusic:'Добавляй музыку из поиска и собирай свои плейлисты.',goSearch:'Перейти к поиску',theme:'Оформление',language:'Язык',general:'Основное',support:'Связь и поддержка',feedback:'Обратная связь',help:'Помочь проекту',account:'Аккаунт',delete:'Удалить личный кабинет',create:'Создать',newAlbum:'Новый альбом',albumHint:'Собирай треки в собственные альбомы'},
-    en: {my:'My music',search:'Search',favorites:'Favorites',playlists:'Playlists',albums:'Albums',settings:'Settings',channel:'Updates channel',all:'All tracks',tracks:'Tracks',searchMusic:'Music search',searchHint:'Find your tracks and discover new music',searchPlaceholder:'Song title or artist...',advanced:'Advanced search',collection:'Your collection',noTracks:'No tracks yet',addMusic:'Add music from search and build your playlists.',goSearch:'Go to search',theme:'Appearance',language:'Language',general:'General',support:'Help & support',feedback:'Feedback',help:'Support the project',account:'Account',delete:'Delete account',create:'Create',newAlbum:'New album',albumHint:'Collect tracks in your own albums'}
-  };
-  function applyLanguage(code) {
-    language = I18N[code] ? code : 'ru';
-    var d = I18N[language];
-    document.documentElement.lang = language;
-    var nav = $$('.nav__item[data-page]');
-    var navKeys = ['my','search','favorites','playlists','albums','settings'];
-    nav.forEach(function (el, i) { var span = el.querySelector('span:not(.nav__badge)'); if (span && d[navKeys[i]]) span.textContent = d[navKeys[i]]; });
-    var link = $('.nav__item--link span'); if (link) link.textContent = d.channel;
-    var setText = function (sel, val) { var el = $(sel); if (el && val) el.textContent = val; };
-    setText('#page-mymusic .section-head h2', d.my); setText('#page-search .section-head h2', d.searchMusic);
-    setText('#page-search .section-sub', d.searchHint); setText('#page-mymusic .empty-card h3', d.noTracks);
-    setText('#page-mymusic .empty-card p', d.addMusic); setText('#page-mymusic .empty-card .btn-primary', d.goSearch);
-    setText('#collectionHead h2', d.collection); setText('#page-playlists .section-head h2', d.playlists);
-    setText('#page-albums .section-head h2', d.albums); setText('.album-sub', d.albumHint);
-    setText('#page-settings .page-title', d.settings); setText('#page-settings .settings-label', d.general);
-    setText('#openThemeModal .settings-item__title', d.theme); setText('#btnLang .settings-item__title', d.language);
-    setText('#btnFeedback .settings-item__title', d.feedback); setText('#page-settings .settings-label:nth-of-type(2)', d.support);
-    setText('#page-settings .settings-label:nth-of-type(3)', d.account); setText('#btnDelete .settings-item__title', d.delete);
-    setText('#btnCreatePlaylist', d.create); setText('#btnCreateAlbum', '＋ ' + d.create);
-    var input = $('#searchInput'); if (input) input.placeholder = d.searchPlaceholder;
-    $$('.tab[data-mymusic-tab]').forEach(function (el) { el.textContent = el.dataset.mymusicTab === 'all' ? d.all : d.favorites; });
-    $$('.tab[data-search-tab]').forEach(function (el) { el.textContent = el.dataset.searchTab === 'tracks' ? d.tracks : d.albums; });
-    $$('.language-option').forEach(function (el) { el.classList.toggle('selected', el.dataset.lang === language); });
-    var langValue = $('#btnLang .settings-item__value'); if (langValue) langValue.textContent = ({ru:'Русский',en:'English'})[language];
-    save(LANG_KEY, language);
-  }
-  $('#btnLang').addEventListener('click', function () { $('#languageModal').hidden = false; });
-  $('#closeLanguageModal').addEventListener('click', function () { $('#languageModal').hidden = true; });
-  $('#languageModal').addEventListener('click', function (e) { if (e.target === $('#languageModal')) $('#languageModal').hidden = true; });
-  $$('.language-option').forEach(function (el) { el.addEventListener('click', function () { applyLanguage(el.dataset.lang); }); });
-  applyLanguage(language);
-
-  // ===== Навигация =====
-  (function installSupportBannerOnPages() {
-    var original = document.querySelector('#page-mymusic .support-banner');
-    if (!original) return;
-    document.querySelectorAll('.page:not(#page-settings)').forEach(function(page) {
-      if (page.querySelector('.support-banner')) return;
-      page.insertBefore(original.cloneNode(true), page.firstChild);
-    });
-  })();
-
-  function goPage(name) {
-    $$('.page').forEach(function (p) { p.classList.remove('active'); });
-    var page = $('#page-' + name);
-    if (page) page.classList.add('active');
-    $$('.nav__item[data-page]').forEach(function (b) { b.classList.toggle('active', b.getAttribute('data-page') === name); });
-    $('.content').scrollTop = 0;
-  }
-  $$('.nav__item[data-page]').forEach(function (btn) { btn.addEventListener('click', function () { goPage(btn.getAttribute('data-page')); }); });
-  $$('[data-goto]').forEach(function (btn) { btn.addEventListener('click', function () { goPage(btn.getAttribute('data-goto')); }); });
-
-  // ===== Табы =====
-  function bindTabs(selector, attr, onChange) {
-    $$(selector).forEach(function (tab) {
-      tab.addEventListener('click', function () {
-        $$(selector).forEach(function (t) { t.classList.remove('active'); });
-        tab.classList.add('active');
-        onChange(tab.getAttribute(attr));
-      });
-    });
-  }
-  bindTabs('[data-mymusic-tab]', 'data-mymusic-tab', function (v) { mymusicTab = v; renderMyMusic(); });
-  bindTabs('[data-search-tab]', 'data-search-tab', function (v) { searchTab = v; renderSearch(); });
-  bindTabs('[data-fav-tab]', 'data-fav-tab', function (v) { favTab = v; favTitle(); renderFavs(); });
-
-  function registerTrack(t) {
-    if (!t || t.id == null) return t;
-    trackRegistry[String(t.id)] = t;
-    return t;
-  }
-
-  // ===== Поиск музыки =====
-  function absUrl(u) {
-    if (!u) return '';
-    if (u.indexOf('http') === 0) return u;
-    return BACKEND_URL + u;
-  }
-
-  function fetchTracks(query) {
-    if (BACKEND_URL) {
-      var url = BACKEND_URL + '/api/search?q=' + encodeURIComponent(query);
-      return fetch(url)
-        .then(function (r) { if (!r.ok) throw new Error('backend HTTP ' + r.status); return r.json(); })
-        .then(function (d) {
-          var tracks = (d.tracks || []).map(function (t) {
-            var dur = t.dur || (t.duration ? Math.floor(t.duration / 60) + ':' + ('0' + (t.duration % 60)).slice(-2) : '');
-            return {
-              id: String(t.id), title: t.title, artist: t.artist || '',
-              dur: dur, cover: absUrl(t.cover || ''),
-              preview: absUrl(t.preview_url || t.preview || t.stream_url || ''),
-              full: t.full !== false, source: t.source || 'ru'
-            };
-          }).filter(function (t) { return !!t.preview; });
-          return tracks;
-        });
-    }
-    return Promise.resolve([]);
-  }
-
-  // ===== Отрисовка =====
-  function isFav(id) { return favs.some(function(f) { return String(f.id) === String(id); }); }
-  function playSvg() { return '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5l12 7-12 7V5z"/></svg>'; }
-  function pauseSvg() { return '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z"/></svg>'; }
-
-  function coverFallback(t) {
-    var title = String((t && t.title) || 'Без названия').slice(0, 48);
-    var artist = String((t && t.artist) || 'EvuMusic').slice(0, 42);
-    var hash = 0, seed = String((t && t.id) || title + artist);
-    for (var i = 0; i < seed.length; i++) hash = ((hash << 5) - hash + seed.charCodeAt(i)) | 0;
-    var hue = Math.abs(hash) % 360;
-    function xml(v) { return String(v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&apos;'); }
-    function fit(v, max) { return v.length > max ? v.slice(0, max - 1) + '…' : v; }
-    var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="600" height="600" viewBox="0 0 600 600">' +
-      '<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="hsl(' + hue + ',58%,35%)"/><stop offset="1" stop-color="#07111f"/></linearGradient></defs>' +
-      '<rect width="600" height="600" rx="48" fill="url(#g)"/>' +
-      '<text x="54" y="420" fill="#fff" font-family="Arial,sans-serif" font-size="34" font-weight="700">' + xml(fit(title, 25)) + '</text>' +
-      '<text x="56" y="465" fill="#fff" fill-opacity=".72" font-family="Arial,sans-serif" font-size="22">' + xml(fit(artist, 32)) + '</text></svg>';
-    return 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(svg);
-  }
-
-  function trackHTML(t) {
-    var fav = isFav(t.id);
-    var ownCover = t.cover || coverFallback(t);
-    t.cover = ownCover;
-    var cover = '<img class="track__cover track__cover-image js-track-cover" src="' + ownCover + '" alt="" loading="lazy">';
-    return '<div class="track" data-id="' + esc(String(t.id)) + '">' +
-      cover +
-      '<div class="track__meta"><div class="track__title">' + esc(t.title) + '</div>' +
-      '<div class="track__artist">' + esc(t.artist) + (t.dur ? ' · ' + esc(t.dur) : '') + '</div></div>' +
-      '<div class="track__actions">' +
-      '<button class="track__btn js-play" title="Играть">' + playSvg() + '</button>' +
-      '<button class="track__btn js-fav' + (fav ? ' active' : '') + '" title="В избранное">' +
-      (fav ? '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 20.5s-7.5-4.7-7.5-10A4.2 4.2 0 0 1 12 7.5a4.2 4.2 0 0 1 7.5 3c0 5.3-7.5 10-7.5 10z"/></svg>'
-           : '<svg viewBox="0 0 24 24" fill="none"><path d="M12 20.5s-7.5-4.7-7.5-10A4.2 4.2 0 0 1 12 7.5a4.2 4.2 0 0 1 7.5 3c0 5.3-7.5 10-7.5 10z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>') +
-      '</button>' +
-      '<button class="track__btn js-addpl" title="В плейлист"><svg viewBox="0 0 24 24" fill="none"><path d="M4 7h12M4 12h12M4 17h8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M18 13.5V9l3 1.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="16.5" cy="16" r="2" stroke="currentColor" stroke-width="2"/></svg></button>' +
-      '</div></div>';
-  }
-
-  function renderList(container, tracks) {
-    container.innerHTML = tracks.map(trackHTML).join('');
-    updateRowPlayState();
-  }
-
-  // ===== Страницы =====
-  function renderMyMusic() {
-    var tracks = library;
-    $('#myEmpty').hidden = tracks.length > 0;
-    $('#myCount').textContent = 'Треков: ' + tracks.length;
-    renderList($('#myList'), tracks);
-  }
-  function favTitle() {
-    $('#favTitle').textContent = favTab === 'fav' ? 'Любимое' : 'Моя музыка';
-  }
-  function renderFavs() {
-    var tracks = favs;
-    $('#favEmpty').hidden = tracks.length > 0;
-    $('#favCount').textContent = 'Треков: ' + tracks.length;
-    renderList($('#favList'), tracks);
-    $('#favBadge').textContent = favs.length;
-  }
-  function renderCollection() {
-    var tracks = library;
-    $('#collEmpty').hidden = tracks.length > 0;
-    $('#collCount').textContent = 'Треков: ' + tracks.length;
-    renderList($('#collList'), tracks);
-  }
-
-  function renderSearch() {
-    var q = ($('#searchInput').value || '').trim();
-    if (searchTab === 'albums' || !q) {
-      $('#searchEmpty').hidden = false;
-      $('#searchEmpty').innerHTML = '<p>Начни вводить название — полные треки</p>';
-      $('#searchResults').innerHTML = '';
-      renderCollection();
-      return;
-    }
-
-    $('#searchEmpty').hidden = true;
-    $('#searchResults').innerHTML = '<div class="search-hint">Ищу треки…</div>';
-    var reqId = ++searchRequestId;
-
-    fetchTracks(q).then(function (tracks) {
-      if (reqId !== searchRequestId) return;
-      tracks.forEach(registerTrack);
-      if (!tracks || !tracks.length) {
-        $('#searchEmpty').hidden = false;
-        $('#searchEmpty').innerHTML = '<p>Ничего не найдено по «' + esc(q) + '»</p>';
-        $('#searchResults').innerHTML = '';
-        return;
-      }
-      $('#searchEmpty').hidden = true;
-      renderList($('#searchResults'), tracks);
-    }).catch(function () {
-      if (reqId !== searchRequestId) return;
-      $('#searchEmpty').hidden = false;
-      $('#searchEmpty').innerHTML = '<p>Ошибка поиска. Попробуй ещё раз.</p>';
-      $('#searchResults').innerHTML = '';
-    });
-    renderCollection();
-  }
-
-  $('#searchInput').addEventListener('input', function () {
-    clearTimeout(searchTimer);
-    searchTimer = setTimeout(renderSearch, 700);
-  });
-  $('#searchInput').addEventListener('keydown', function (e) {
-    if (e.key === 'Enter') { clearTimeout(searchTimer); renderSearch(); }
-  });
-
-  // ===== Плейлисты =====
-  var addToPlaylistTrackId = null;
-  var activePlIdx = null;
-
-  function openAddToPlaylist(trackId) {
-    addToPlaylistTrackId = trackId;
-    var list = $('#playlistPickList');
-    var picks = playlists.map(function (p, idx) { return '<button class="playlist-pick-item" data-pl-idx="' + idx + '"><span>🎵</span><b>' + esc(p.name) + '</b><span>' + (p.count || 0) + ' треков</span></button>'; });
-    albums.forEach(function (a, idx) { picks.push('<button class="playlist-pick-item" data-album-idx="' + idx + '"><span>💿</span><b>' + esc(a.name) + '</b><span>' + (a.tracks || []).length + ' треков · альбом</span></button>'); });
-    list.innerHTML = picks.length ? picks.join('') : '<p class="empty-hint">Пока нет плейлистов или альбомов.</p>';
-    $('#plNewRow').hidden = true;
-    $('#addToPlaylistModal').hidden = false;
-  }
-  function closeAddToPlaylist() { $('#addToPlaylistModal').hidden = true; addToPlaylistTrackId = null; }
-
-  document.getElementById('cancelAddToPlaylist').addEventListener('click', closeAddToPlaylist);
-  document.getElementById('addToPlaylistModal').addEventListener('click', function (e) { if (e.target === document.getElementById('addToPlaylistModal')) closeAddToPlaylist(); });
-
-  document.getElementById('createPlaylistInline').addEventListener('click', function () {
-    $('#plNewRow').hidden = false;
-    $('#plNewInput').focus();
-  });
-  
-  async function createPlFromInline() {
-    var name = ($('#plNewInput').value || '').trim();
-    if (!name) { toast('Введи название'); return; }
-    if (playlists.some(function (p) { return (p.name || '').toLowerCase() === name.toLowerCase(); })) {
-      toast('Такой плейлист уже есть'); return;
-    }
-    $('#plNewSave').disabled = true;
-    var newPl = await apiCreatePlaylist(name);
-    $('#plNewSave').disabled = false;
-    if (newPl) {
-        playlists.push(newPl);
-        $('#plNewInput').value = '';
-        $('#plNewRow').hidden = true;
-        renderPlaylists();
-        openAddToPlaylist(addToPlaylistTrackId); 
-        toast('Плейлист «' + name + '» создан');
-    }
-  }
-  document.getElementById('plNewSave').addEventListener('click', createPlFromInline);
-  document.getElementById('plNewInput').addEventListener('keydown', function (e) { if (e.key === 'Enter') createPlFromInline(); });
-
-  document.getElementById('addToPlaylistModal').addEventListener('click', async function (e) {
-    var btn = e.target.closest('.playlist-pick-item');
-    if (!btn) return;
-    if (!addToPlaylistTrackId) { toast('Трек не найден'); return; }
-    var tr = findTrack(addToPlaylistTrackId);
-    if (!tr) return;
-
-    var albumIdx = btn.hasAttribute('data-album-idx') ? parseInt(btn.getAttribute('data-album-idx'), 10) : -1;
-    
-    if (albumIdx >= 0) {
-        var target = albums[albumIdx];
-        if (!target.tracks) target.tracks = [];
-        var already = target.tracks.some(function (x) { var xid = (x && typeof x === 'object') ? x.id : x; return String(xid) === String(tr.id); });
-        if (!already) {
-            target.tracks.push(tr);
-            save(ALBUM_KEY, albums);
-            toast('Добавлено в «' + target.name + '»');
-            renderAlbums(); 
-        } else { toast('Уже добавлено'); }
-        closeAddToPlaylist();
-    } else {
-        var plIdx = parseInt(btn.getAttribute('data-pl-idx'), 10);
-        var pl = playlists[plIdx];
-        if (!pl) return;
-
-        btn.disabled = true;
-        var success = await apiAddTrackToPlaylist(pl.id, tr);
-        btn.disabled = false;
-
-        if (success) {
-            if(!pl.tracks) pl.tracks = [];
-            if(!pl.tracks.some(function(x){ return String(x.id) === String(tr.id); })) {
-                pl.tracks.push(tr);
-                pl.count = pl.tracks.length;
-            }
-            toast('Добавлено в «' + pl.name + '»');
-            renderPlaylists();
-            if (activePlIdx === plIdx) renderPlaylistDetail();
-            closeAddToPlaylist();
-        } else {
-            toast('Ошибка сервера');
-        }
-    }
-  });
-
-  // ===== Действия с треками =====
-  function findTrack(id) {
-    return trackRegistry[id] || favs.find(function (f) { return String(f.id) === String(id); }) || library.find(function (l) { return String(l.id) === String(id); });
-  }
-  
-  function triggerPlay(row) {
-    if (!row) return;
-    var id = row.getAttribute('data-id');
-    var tr = findTrack(id);
-    if (!tr) { toast('Трек не найден'); return; }
-    if (!tr.preview) { toast('Нет превью для этого трека'); return; }
-    queueIds = [];
-    row.parentElement.querySelectorAll('.track').forEach(function (r) { queueIds.push(r.getAttribute('data-id')); });
-    playPreview(tr);
-  }
-
-  document.getElementById('content').addEventListener('click', function (e) {
-    var coverEl = e.target.closest('.track__cover');
-    if (coverEl) { triggerPlay(coverEl.closest('.track')); return; }
-    var btn = e.target.closest('.track__btn');
-    if (!btn) return;
-    var row = btn.closest('.track');
-    var id = row.getAttribute('data-id');
-    var tr = findTrack(id);
-
-    if (btn.classList.contains('js-play')) {
-      triggerPlay(row);
-    } else if (btn.classList.contains('js-fav')) {
-      if (!tr) return;
-      btn.disabled = true;
-      apiToggleFav(tr).then(function() { btn.disabled = false; });
-    } else if (btn.classList.contains('js-addpl')) {
-      if (!tr) return;
-      openAddToPlaylist(id);
-    }
-  });
-
-  function refreshAll() {
-    renderMyMusic();
-    renderFavs();
-    renderSearch();
-  }
-
-  function renderPlaylists() {
-    var grid = $('#playlistGrid');
-    var html = '';
-    playlists.forEach(function (p, idx) {
-      html += '<div class="playlist-card" data-pl="' + idx + '"><span class="playlist-card__plus">🎵</span><b>' + esc(p.name) + '</b><span>' + (p.count || 0) + ' треков</span></div>';
-    });
-    html += '<button class="playlist-card playlist-card--new" id="newPlaylistCard"><span class="playlist-card__plus">+</span><b>Новый плейлист</b><span>Добавить плейлист</span></button>';
-    grid.innerHTML = html;
-    $('#newPlaylistCard').addEventListener('click', openPlaylistModal);
-    $$('.playlist-card[data-pl]').forEach(function (card) {
-      card.addEventListener('click', function () { openPlaylist(parseInt(card.getAttribute('data-pl'), 10)); });
-    });
-  }
-  $('#plBack').addEventListener('click', function () { goPage('playlists'); });
-  
-  function openPlaylist(idx) {
-    if (!playlists[idx]) { goPage('playlists'); return; }
-    activePlIdx = idx;
-    renderPlaylistDetail();
-    goPage('plview');
-  }
-  function renderPlaylistDetail() {
-    var pl = playlists[activePlIdx];
-    if (!pl) return;
-    $('#plViewTitle').textContent = pl.name;
-    var tracks = (pl.tracks || []).filter(Boolean);
-    $('#plViewEmpty').hidden = tracks.length > 0;
-    renderList($('#plViewList'), tracks);
-  }
-  function openPlaylistModal() {
-    $('#playlistNameInput').value = '';
-    $('#playlistModal').hidden = false;
-    setTimeout(function () { $('#playlistNameInput').focus(); }, 50);
-  }
-  function closePlaylistModal() { $('#playlistModal').hidden = true; }
-  $('#btnCreatePlaylist').addEventListener('click', openPlaylistModal);
-  $('#cancelPlaylist').addEventListener('click', closePlaylistModal);
-  
-  $('#savePlaylist').addEventListener('click', async function () {
-    var name = ($('#playlistNameInput').value || '').trim();
-    if (!name) { toast('Введи название'); return; }
-    $('#savePlaylist').disabled = true;
-    var newPl = await apiCreatePlaylist(name);
-    $('#savePlaylist').disabled = false;
-    if (newPl) {
-        playlists.push(newPl);
-        closePlaylistModal();
-        renderPlaylists();
-        toast('Плейлист «' + name + '» создан');
-    }
-  });
-  $('#playlistNameInput').addEventListener('keydown', function (e) { if (e.key === 'Enter') $('#savePlaylist').click(); });
-
-  // ===== Альбомы =====
-  function renderAlbums() {
-    var grid = $('#albumGrid');
-    if (!grid) return;
-    $('#albumEmpty').hidden = albums.length > 0;
-    grid.innerHTML = albums.map(function (a, idx) {
-      return '<button class="playlist-card" data-album="' + idx + '"><span class="playlist-card__plus">💿</span><b>' + esc(a.name) + '</b><span>' + ((a.tracks || []).length) + ' треков</span></button>';
-    }).join('');
-    grid.querySelectorAll('[data-album]').forEach(function (card) { card.addEventListener('click', function () { openAlbum(parseInt(card.dataset.album, 10)); }); });
-  }
-  function openAlbum(idx) { if (!albums[idx]) return; activeAlbumIdx = idx; renderAlbumDetail(); goPage('alview'); }
-  function renderAlbumDetail() {
-    var a = albums[activeAlbumIdx]; if (!a) return;
-    $('#albumViewTitle').textContent = a.name;
-    var tracks = (a.tracks || []).filter(Boolean);
-    $('#albumViewEmpty').hidden = tracks.length > 0;
-    renderList($('#albumViewList'), tracks);
-  }
-  function openAlbumModal() { $('#albumNameInput').value = ''; $('#albumModal').hidden = false; $('#albumNameInput').focus(); }
-  $('#btnCreateAlbum').addEventListener('click', openAlbumModal);
-  $('#cancelAlbum').addEventListener('click', function () { $('#albumModal').hidden = true; });
-  $('#saveAlbum').addEventListener('click', function () {
-    var name = ($('#albumNameInput').value || '').trim();
-    if (!name) { toast('Введи название альбома'); return; }
-    if (albums.some(function (a) { return a.name.toLowerCase() === name.toLowerCase(); })) { toast('Такой альбом уже есть'); return; }
-    albums.push({ name: name, tracks: [], createdAt: Date.now() }); save(ALBUM_KEY, albums);
-    $('#albumModal').hidden = true; renderAlbums(); toast('Альбом «' + name + '» создан');
-  });
-  $('#albumNameInput').addEventListener('keydown', function (e) { if (e.key === 'Enter') $('#saveAlbum').click(); });
-  $('#albumBack').addEventListener('click', function () { goPage('albums'); });
-
-  // ===== Настройки =====
-  $('#openThemeModal').addEventListener('click', function () { $('#themeModal').hidden = false; });
-  $('#closeThemeModal').addEventListener('click', function () { $('#themeModal').hidden = true; });
-  $('#themeModal').addEventListener('click', function (e) { if (e.target === $('#themeModal')) $('#themeModal').hidden = true; });
-  $$('.theme-option').forEach(function (b) {
-    b.addEventListener('click', function () { applyTheme(b.getAttribute('data-theme-pick')); toast('Тема: ' + THEME_NAMES[b.getAttribute('data-theme-pick')]); });
-  });
-
-  $('#btnFeedback').addEventListener('click', function () { window.open('https://t.me/EvuMusic', '_blank'); });
-  
-  var confirmCb = null;
-  function showConfirm(text, cb) { $('#confirmText').textContent = text; $('#confirmOverlay').hidden = false; confirmCb = cb; }
-  $('#confirmCancel').addEventListener('click', function () { $('#confirmOverlay').hidden = true; confirmCb = null; });
-  $('#confirmOk').addEventListener('click', function () { $('#confirmOverlay').hidden = true; if (confirmCb) confirmCb(); confirmCb = null; });
-  
-  $('#btnDelete').addEventListener('click', function () {
-    showConfirm('Удалить личный кабинет? Это действие нельзя отменить.', function () {
-      library = []; favs = []; playlists = []; albums = [];
-      save(ALBUM_KEY, albums);
-      refreshAll(); renderPlaylists(); renderAlbums();
-      toast('Личный кабинет удалён локально');
-    });
-  });
-
-  // ===== Плеер =====
-  var previewAudio = null;
-  var previewTrackId = null;
-  var playerState = { playing: false };
-  window.__evuAudio = function () { return previewAudio; };
-
-  function startAudio(url, t) {
-    if (previewAudio) { previewAudio.pause(); previewAudio = null; }
-    previewTrackId = String(t.id);
-    previewAudio = new Audio(url);
-    previewAudio.preload = 'auto';
-    previewAudio.crossOrigin = 'anonymous';
-    previewAudio.volume = volume / 100;
-    previewAudio.currentTime = 0;
-    previewAudio.load();
-    var playPromise = previewAudio.play();
-    if (playPromise && playPromise.catch) playPromise.catch(function () {});
-    showPlayer(t);
-    setPlayingUI(true);
-    previewAudio.ontimeupdate = function () {
-      if (previewAudio && !seekDrag) {
-        var dur = (previewAudio.duration && isFinite(previewAudio.duration) && previewAudio.duration > 0) ? previewAudio.duration : 30;
-        $('#playerProgress').style.width = Math.min(100, (previewAudio.currentTime / dur * 100)) + '%';
-      }
-    };
-    previewAudio.onended = function () {
-      $('#playerProgress').style.width = '0%';
-      var idx = queueIds.indexOf(previewTrackId);
-      if (idx >= 0 && idx < queueIds.length - 1) {
-        var nextT = (trackRegistry[queueIds[idx + 1]] || findTrack(queueIds[idx + 1]));
-        if (nextT && nextT.preview) { playPreview(nextT); return; }
-      }
-      setPlayingUI(false);
-    };
-    previewAudio.onplay = function () { setPlayingUI(true); };
-    previewAudio.onpause = function () { setPlayingUI(false); };
-  }
-
-  function playPreview(t) {
-    if (previewAudio && previewTrackId === String(t.id)) {
-      if (previewAudio.paused) { previewAudio.play(); setPlayingUI(true); }
-      else { previewAudio.pause(); setPlayingUI(false); }
-      return;
-    }
-    var audioUrl = t.preview;
-    startAudio(audioUrl, t);
-    showPlayer(t);
-    setPlayingUI(true);
-  }
-  function setPlayingUI(on) {
-    playerState.playing = on;
-    $('#iconPlay').toggleAttribute('hidden', on);
-    $('#iconPause').toggleAttribute('hidden', !on);
-    var playerEl = $('#player');
-    playerEl.classList.toggle('is-playing', on);
-    updateRowPlayState();
-  }
-
-  function updateRowPlayState() {
-    $$('.track').forEach(function (r) {
-      var b = r.querySelector('.track__btn.js-play');
-      if (!b) return;
-      var cur = !!(onPlaying() && previewTrackId && r.getAttribute('data-id') === previewTrackId);
-      r.classList.toggle('is-current', cur);
-      b.innerHTML = cur ? pauseSvg() : playSvg();
-    });
-  }
-  function onPlaying() { return !!playerState.playing; }
-  function showPlayer(t) {
-    $('#player').hidden = false;
-    $('#playerTitle').textContent = t.title;
-    $('#playerArtist').textContent = t.artist;
-    var c = $('#playerCover');
-    var art = t.cover || '';
-    if (art) {
-      c.innerHTML = '<img src="' + esc(art) + '" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:10px">';
-      c.style.background = 'none';
-    } else {
-      c.innerHTML = '';
-      c.style.background = coverColor(String(t.id).length + (t.title || '').length);
-      c.textContent = coverLetter(t.title);
-    }
-    setPlayingUI(true);
-  }
-  function stopPreview() {
-    if (previewAudio) { previewAudio.pause(); previewAudio = null; previewTrackId = null; }
-  }
-
-  var queueIds = []; 
-  function queueTracks() {
-    return queueIds.map(function (id) { return trackRegistry[id] || favs.find(function (f) { return String(f.id) === id; }); }).filter(Boolean);
-  }
-  $('#playerPrev').addEventListener('click', function () {
-    if (!previewAudio || !previewTrackId) return;
-    var q = queueTracks();
-    var idx = q.findIndex(function (t) { return String(t.id) === String(previewTrackId); });
-    if (idx > 0) { playPreview(q[idx - 1]); return; }
-    try { previewAudio.currentTime = 0; } catch (e) {}
-    if (previewAudio.paused) { previewAudio.play().catch(function () {}); }
-    $('#playerProgress').style.width = '0%';
-    setPlayingUI(true);
-  });
-  $('#playerNext').addEventListener('click', function () {
-    if (!previewTrackId) return;
-    var q = queueTracks();
-    var idx = q.findIndex(function (t) { return String(t.id) === String(previewTrackId); });
-    if (idx >= 0 && idx < q.length - 1) { playPreview(q[idx + 1]); }
-    else if (q.length) { playPreview(q[0]); } 
-  });
-
-  var seekDrag = false;
-  var seekEl = $('#playerSeek');
-
-  function seekByPoint(clientX) {
-    var r = seekEl.getBoundingClientRect();
-    if (!r.width) return;
-    var p = Math.min(1, Math.max(0, (clientX - r.left) / r.width));
-    $('#playerProgress').style.width = (p * 100) + '%';
-    if (previewAudio && previewAudio.duration && isFinite(previewAudio.duration) && previewAudio.duration > 0) {
-      previewAudio.currentTime = p * previewAudio.duration;
-    }
-  }
-  function seekStart(clientX) {
-    if (!previewAudio) return;
-    seekDrag = true;
-    $('#playerProgress').classList.add('dragging');
-    seekByPoint(clientX);
-    setPlayingUI(true);
-  }
-  seekEl.addEventListener('mousedown', function (e) { e.preventDefault(); seekStart(e.clientX); });
-  window.addEventListener('mousemove', function (e) { if (seekDrag) seekByPoint(e.clientX); });
-  window.addEventListener('mouseup', function () { if (seekDrag) { seekDrag = false; $('#playerProgress').classList.remove('dragging'); } });
-  seekEl.addEventListener('touchstart', function (e) { seekStart(e.touches[0].clientX); }, { passive: true });
-  window.addEventListener('touchmove', function (e) { if (seekDrag && e.touches[0]) seekByPoint(e.touches[0].clientX); });
-  window.addEventListener('touchend', function () { if (seekDrag) { seekDrag = false; $('#playerProgress').classList.remove('dragging'); } });
-
-  $('#playerToggle').addEventListener('click', function () {
-    if (previewAudio) {
-      if (previewAudio.paused) { previewAudio.play(); setPlayingUI(true); }
-      else { previewAudio.pause(); setPlayingUI(false); }
-      return;
-    }
-    setPlayingUI(!playerState.playing);
-  });
-
-  var volume = 100;
-  var lastVolume = 100;
-  try {
-    var savedVol = parseInt(localStorage.getItem('evu_volume') || '100', 10);
-    if (savedVol >= 0 && savedVol <= 100) volume = savedVol;
-    if (volume > 0) lastVolume = volume;
-  } catch (e) {}
-
-  function applyVolume(v) {
-    var val = Math.max(0, Math.min(100, parseInt(v, 10) || 0));
-    if (previewAudio) previewAudio.volume = val / 100;
-    var slider = $('#playerVolume');
-    slider.value = val;
-    slider.style.setProperty('--vol', val + '%');
-    $('#iconVolOn').toggleAttribute('hidden', val === 0);
-    $('#iconVolOff').toggleAttribute('hidden', val !== 0);
-    try { localStorage.setItem('evu_volume', String(val)); } catch (e) {}
-  }
-  applyVolume(volume);
-
-  $('#playerVolume').addEventListener('input', function () {
-    volume = parseInt(this.value, 10);
-    if (volume > 0) lastVolume = volume;
-    applyVolume(volume);
-  });
-  $('#playerMute').addEventListener('click', function () {
-    if (volume > 0) { lastVolume = volume; volume = 0; }
-    else { volume = lastVolume || 100; }
-    applyVolume(volume);
-  });
-
-  $('#playerClose').addEventListener('click', function () {
-    stopPreview();
-    playerState.playing = false;
-    $('#player').hidden = true;
-    $('#playerProgress').style.width = '0%';
-  });
-
-  // ===== Инициализация =====
-  renderPlaylists();
-  renderAlbums();
-  loadUserData(); // Загружаем любимое и плейлисты с сервера
-  
-})();
+import os
+import re
+import json
+import html
+import hmac
+import hashlib
+import base64
+import time
+import asyncio
+import collections
+from urllib.parse import parse_qsl, urljoin
+from typing import Optional, List
+from contextlib import asynccontextmanager
+
+import asyncpg
+import httpx
+from fastapi import FastAPI, Header, HTTPException, Depends, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ==========================================
+# 1. НАСТРОЙКИ И БАЗА ДАННЫХ
+# ==========================================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+ENABLE_MUZOFOND = os.getenv("MUZOFOND", "1") == "1"
+ENABLE_YANDEX = os.getenv("YANDEX", "1") == "1"
+YM_TOKEN = os.getenv("YM_TOKEN", "").strip()
+PROXY_SECRET = os.getenv("PROXY_SECRET", "evu-music-proxy-secret").encode()
+DEFAULT_SC_CLIENT_ID = "nIjtjiYnjkOhMyh5xrbqEW12DxeJVnic"
+SC_CLIENT_ID = (os.getenv("SC_CLIENT_ID", "") or DEFAULT_SC_CLIENT_ID).strip()
+ENABLE_SOUNDCLOUD = os.getenv("SOUNDCLOUD", "1") == "1"
+SC_API = "https://api-v2.soundcloud.com"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+pool: Optional[asyncpg.Pool] = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global pool
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    print("Connected to Neon DB")
+    yield
+    if pool:
+        await pool.close()
+
+app = FastAPI(title="EvuMusic Backend", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Content-Length", "Content-Range", "Accept-Ranges", "Content-Type"],
+)
+
+_http: Optional[httpx.AsyncClient] = None
+def get_http() -> httpx.AsyncClient:
+    global _http
+    if _http is None:
+        _http = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            follow_redirects=True,
+            headers={"User-Agent": USER_AGENT, "Accept-Language": "ru-RU,ru;q=0.9"},
+        )
+    return _http
+
+# ==========================================
+# 2. ЛОГИКА СОХРАНЕНИЙ (Neon)
+# ==========================================
+class TrackData(BaseModel):
+    id: str
+    title: str
+    artist: str
+    duration: str = ""
+    cover: str = ""
+    source: str = ""
+
+class PlaylistData(BaseModel):
+    title: str
+
+class PlaylistTrackData(TrackData):
+    playlist_id: int
+
+def verify_telegram_data(init_data: str) -> dict:
+    if not init_data: raise HTTPException(status_code=401, detail="No init data")
+    try:
+        parsed_data = dict(parse_qsl(init_data))
+        hash_str = parsed_data.pop('hash')
+        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed_data.items()))
+        secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+        if hmac.compare_digest(calculated_hash, hash_str):
+            return json.loads(parsed_data['user'])
+        raise HTTPException(status_code=403, detail="Invalid auth data")
+    except Exception as e:
+        raise HTTPException(status_code=403, detail=str(e))
+
+async def get_user_id(authorization: str = Header(None)):
+    user = verify_telegram_data(authorization)
+    return user['id']
+
+@app.get("/api/user_data")
+async def get_user_data(user_id: int = Depends(get_user_id)):
+    async with pool.acquire() as conn:
+        favs = await conn.fetch("SELECT track_id as id, title, artist, duration, cover, source FROM favorites WHERE user_id=$1", user_id)
+        lib = await conn.fetch("SELECT track_id as id, title, artist, duration, cover, source FROM library_tracks WHERE user_id=$1", user_id)
+        playlists = await conn.fetch("SELECT id, title as name FROM playlists WHERE user_id=$1", user_id)
+        pls = []
+        for pl in playlists:
+            tracks = await conn.fetch("SELECT track_id as id, title, artist, duration, cover, source FROM playlist_tracks WHERE playlist_id=$1 ORDER BY position", pl['id'])
+            pls.append({"id": pl['id'], "name": pl['name'], "tracks": [dict(t) for t in tracks], "count": len(tracks)})
+    return {"favorites": [dict(f) for f in favs], "library": [dict(l) for l in lib], "playlists": pls}
+
+@app.post("/api/favorites")
+async def toggle_favorite(track: TrackData, user_id: int = Depends(get_user_id)):
+    async with pool.acquire() as conn:
+        exists = await conn.fetchval("SELECT 1 FROM favorites WHERE user_id=$1 AND track_id=$2", user_id, track.id)
+        if exists:
+            await conn.execute("DELETE FROM favorites WHERE user_id=$1 AND track_id=$2", user_id, track.id)
+            return {"status": "removed"}
+        else:
+            await conn.execute(
+                "INSERT INTO favorites (user_id, track_id, title, artist, duration, cover, source) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                user_id, track.id, track.title, track.artist, track.duration, track.cover, track.source
+            )
+            return {"status": "added"}
+
+@app.post("/api/playlists")
+async def create_playlist(data: PlaylistData, user_id: int = Depends(get_user_id)):
+    async with pool.acquire() as conn:
+        pl_id = await conn.fetchval("INSERT INTO playlists (user_id, title) VALUES ($1,$2) RETURNING id", user_id, data.title)
+        return {"id": pl_id, "name": data.title, "tracks": [], "count": 0}
+
+@app.post("/api/playlists/add_track")
+async def add_track_to_playlist(data: PlaylistTrackData, user_id: int = Depends(get_user_id)):
+    async with pool.acquire() as conn:
+        owner = await conn.fetchval("SELECT user_id FROM playlists WHERE id=$1", data.playlist_id)
+        if owner != user_id: raise HTTPException(status_code=403, detail="Not your playlist")
+        await conn.execute(
+            "INSERT INTO playlist_tracks (playlist_id, track_id, title, artist, duration, cover, source) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING",
+            data.playlist_id, data.id, data.title, data.artist, data.duration, data.cover, data.source
+        )
+        return {"status": "ok"}
+
+# ==========================================
+# 3. ЛОГИКА ПОИСКА МУЗЫКИ (из ru-backend)
+# ==========================================
+def sign(url: str) -> str:
+    blob = base64.urlsafe_b64encode(url.encode("utf-8")).decode().rstrip("=")
+    sig = hmac.new(PROXY_SECRET, blob.encode("ascii"), hashlib.sha256).hexdigest()[:16]
+    return blob + "." + sig
+
+def unsign(token: str) -> str:
+    blob, _, sig = token.rpartition(".")
+    if not blob or not sig: raise HTTPException(status_code=400, detail="Bad token")
+    expect = hmac.new(PROXY_SECRET, blob.encode("ascii"), hashlib.sha256).hexdigest()[:16]
+    if not hmac.compare_digest(sig, expect): raise HTTPException(status_code=403, detail="Bad signature")
+    pad = "=" * (-len(blob) % 4)
+    try: return base64.urlsafe_b64decode(blob + pad).decode("utf-8")
+    except Exception: raise HTTPException(status_code=400, detail="Bad payload")
+
+def fmt_duration(seconds: int) -> str:
+    seconds = int(seconds or 0)
+    return "%d:%02d" % (seconds // 60, seconds % 60)
+
+def norm(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+# Muzofond
+_ITEM_SPLIT = re.compile(r'<li class="item" ')
+_DL_RE = re.compile(r'class="play" data-id="\d+" data-url="(https://dl[^"]+)"')
+_ARTIST_RE = re.compile(r'<span class="artist">(.*?)</span>', re.S)
+_TRACK_RE = re.compile(r'<span class="track">(.*?)</span>', re.S)
+_IMG_RE = re.compile(r'data-img="([^"]+)"')
+
+def _strip_tags(s: str) -> str:
+    return norm(html.unescape(re.sub(r"<[^>]+>", "", s or "")))
+
+def parse_muzofond(html_text: str) -> list:
+    out, by_url = [], {}
+    for body in _ITEM_SPLIT.split(html_text)[1:]:
+        idm = re.match(r'data-id="(\d+)"', body)
+        dm = re.search(r'data-duration="(\d+)"', body)
+        urlm = _DL_RE.search(body)
+        if not (idm and urlm): continue
+        tm = _TRACK_RE.search(body)
+        am = _ARTIST_RE.search(body)
+        title = _strip_tags(tm.group(1)) if tm else ""
+        artist = _strip_tags(am.group(1)) if am else ""
+        if not title: continue
+        img = _IMG_RE.search(body)
+        cover = ""
+        if img and img.group(1).startswith("/"): cover = "https://muzofond.fm" + img.group(1)
+        elif img: cover = img.group(1)
+        item = {"ext_id": idm.group(1), "title": title, "artist": artist or "Неизвестен", "duration": int(dm.group(1)) if dm else 0, "cover": cover, "audio_url": urlm.group(1), "source": "muzofond"}
+        prev = by_url.get(item["audio_url"])
+        if prev is None: by_url[item["audio_url"]] = item
+        elif len(item["title"]) < len(prev["title"]): by_url[item["audio_url"]] = item
+    return list(by_url.values())
+
+async def muzofond_fetch(url: str) -> list:
+    try:
+        r = await get_http().get(url)
+        if r.status_code != 200: return []
+        return parse_muzofond(r.text)
+    except Exception: return []
+
+async def muzofond_search(query: str, limit: int) -> list:
+    params_a = httpx.QueryParams({"q": query, "artist": "0"})
+    params_b = httpx.QueryParams({"q": query, "artist": "1"})
+    results = await asyncio.gather(
+        muzofond_fetch("https://muzofond.fm/music?" + str(params_a)),
+        muzofond_fetch("https://muzofond.fm/music?" + str(params_b)),
+        return_exceptions=True
+    )
+    merged, by_url = [], {}
+    for res in results:
+        if isinstance(res, Exception) or not res: continue
+        for t in res:
+            key = t["audio_url"]
+            prev = by_url.get(key)
+            if prev is None: by_url[key] = t; merged.append(t)
+            elif len(t["title"]) < len(prev["title"]): prev.update(t)
+    return rank(merged, query)[:limit]
+
+# SoundCloud
+def sc_params(**extra):
+    p = {"client_id": SC_CLIENT_ID}
+    p.update(extra)
+    return p
+
+async def soundcloud_search(query: str, limit: int) -> list:
+    if not ENABLE_SOUNDCLOUD: return []
+    try:
+        r = await get_http().get(SC_API + "/search/tracks", params=sc_params(q=query, limit=min(limit, 50)))
+        if r.status_code != 200: return []
+        out = []
+        for t in r.json().get("collection", [])[:limit]:
+            if not t: continue
+            out.append({
+                "ext_id": str(t["id"]), "title": norm(t.get("title") or "Без названия"),
+                "artist": norm((t.get("user") or {}).get("username") or "Неизвестен"),
+                "duration": int((t.get("duration") or 0) / 1000),
+                "cover": "", "source": "soundcloud", "full": True
+            })
+        return out
+    except Exception: return []
+
+_sc_cache = collections.OrderedDict()
+SC_CACHE_SIZE = 10
+async def soundcloud_stream_bytes(sc_id: str) -> bytes:
+    if sc_id in _sc_cache:
+        _sc_cache.move_to_end(sc_id)
+        return _sc_cache[sc_id]
+    cli = get_http()
+    r = await cli.get(SC_API + "/tracks/" + sc_id, params=sc_params())
+    if r.status_code != 200: raise HTTPException(status_code=404, detail="SoundCloud track not found")
+    t = r.json()
+    trans = (t.get("media") or {}).get("transcodings") or []
+    frag = [x for x in trans if "aac_160k" in (x.get("preset") or "")] or [x for x in trans if x.get("format", {}).get("protocol") == "hls"]
+    if not frag: raise HTTPException(status_code=502, detail="No HLS stream for this track")
+    loc = None
+    for x in frag:
+        rl = await cli.get(x["url"], params=sc_params())
+        if rl.status_code == 200:
+            loc = (rl.json() or {}).get("url")
+            if loc: break
+    if not loc: raise HTTPException(status_code=502, detail="Playlist resolve failed")
+    pl = await cli.get(loc)
+    if pl.status_code != 200: raise HTTPException(status_code=502, detail="Playlist fetch failed")
+    text = pl.text
+    init_m = re.search(r'#EXT-X-MAP:URI="([^"]+)"', text)
+    segs = [ln.strip() for ln in text.splitlines() if ln and not ln.startswith("#")]
+    if not segs: raise HTTPException(status_code=502, detail="Empty playlist")
+    blob = bytearray()
+    if init_m:
+        ri = await cli.get(urljoin(loc, init_m.group(1)))
+        if ri.status_code == 200: blob += ri.content
+    for s in segs:
+        rs = await cli.get(urljoin(loc, s))
+        if rs.status_code != 200: break
+        blob += rs.content
+    data = bytes(blob)
+    if len(data) < 2048: raise HTTPException(status_code=502, detail="Stream assemble failed")
+    _sc_cache[sc_id] = data
+    while len(_sc_cache) > SC_CACHE_SIZE: _sc_cache.popitem(last=False)
+    return data
+
+# Yandex
+_ym_client = None
+def get_ym():
+    global _ym_client
+    if _ym_client is None:
+        try:
+            from yandex_music import Client
+            _ym_client = Client(YM_TOKEN) if YM_TOKEN else Client()
+            _ym_client.init()
+        except Exception: return None
+    return _ym_client
+
+def yandex_search_sync(query: str, limit: int) -> list:
+    client = get_ym()
+    if not client: return []
+    res = client.search(query)
+    if not res or not res.tracks: return []
+    out, full = [], bool(YM_TOKEN)
+    for t in res.tracks.results[:limit]:
+        artist = t.artists[0].name if t.artists else "Неизвестен"
+        cover = "https://" + t.cover_uri.replace("%%", "400x400") if t.cover_uri else ""
+        out.append({"ext_id": str(t.id), "title": norm(t.title or "Без названия"), "artist": artist, "duration": (t.duration_ms or 0) // 1000, "cover": cover, "audio_url": None, "ym_id": str(t.id), "source": "yandex", "full": full})
+    return out
+
+async def yandex_search(query: str, limit: int) -> list:
+    if not ENABLE_YANDEX: return []
+    try:
+        res = await asyncio.to_thread(yandex_search_sync, query, limit + 10)
+        return rank(res, query)[:limit]
+    except Exception: return []
+
+def rank(tracks: list, query: str) -> list:
+    words = [w for w in re.split(r"\W+", (query or "").lower(), flags=re.U) if len(w) > 1]
+    q = (query or "").lower().strip()
+    junk_re = re.compile(r"(cover|кавер|кувер|remix|ремикс|remake|караоке|karaoke|instrumental|инструментал|мини-?атюра|миниат|припев|ringtone|рингтон|reaction|реакция|live at|bootleg|\bминус(овка)?\b|\(live\b|\blive\)|radio ?edit)", re.I)
+    def score(t):
+        title, artist = t.get("title", "").lower(), t.get("artist", "").lower()
+        hay = title + " " + artist
+        s = sum(2 for w in words if w in hay)
+        if words and all(w in title for w in words): s += 10
+        if q and (title.startswith(q) or hay.startswith(q)): s += 8
+        if q and (q == title or q + "?" == title): s += 15
+        elif q and q in title: s += 4
+        if q and junk_re.search(title) and not junk_re.search(q): s -= 12
+        if t.get("full", True): s += 1
+        if not t.get("duration"): s -= 3
+        return -s
+    tracks = [t for t in tracks if t.get("title")]
+    tracks.sort(key=score)
+    tracks.sort(key=lambda t: 0 if t.get("full", True) else 1)
+    return tracks
+
+def pack(t: dict) -> dict:
+    full = t.get("full", True)
+    if t.get("audio_url"): stream = "/api/stream/" + sign(t["audio_url"])
+    elif t.get("source") == "yandex" and t.get("ym_id"): stream = "/api/audio/" + t["ym_id"]
+    elif t.get("source") == "soundcloud" and t.get("ext_id"): stream = "/api/sc/" + t["ext_id"]
+    else: stream = ""
+    cover = t.get("cover") or ""
+    if cover: cover = "/api/cover/" + sign(cover)
+    return {"id": t["source"] + "_" + t["ext_id"], "title": t["title"], "artist": t["artist"], "duration": t.get("duration", 0), "dur": fmt_duration(t.get("duration", 0)), "cover": cover, "stream_url": stream, "preview_url": stream, "preview": stream, "full": full, "source": t["source"]}
+
+@app.get("/api/search")
+async def search(q: Optional[str] = Query(None), query: Optional[str] = Query(None), limit: int = Query(30, ge=1, le=100)):
+    try:
+        term = norm(q or query or "")
+        if not term: return {"tracks": []}
+        tasks = []
+        if ENABLE_MUZOFOND: tasks.append(muzofond_search(term, limit))
+        if ENABLE_YANDEX: tasks.append(yandex_search(term, limit))
+        if ENABLE_SOUNDCLOUD: tasks.append(soundcloud_search(term, limit))
+        if not tasks: return {"tracks": []}
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        merged, seen = [], set()
+        for res in results:
+            if isinstance(res, Exception) or not res: continue
+            for t in res:
+                key = (str(t.get("artist") or "").lower(), str(t.get("title") or "").lower())
+                if key in seen: continue
+                seen.add(key)
+                merged.append(t)
+        merged = rank(merged, term)[:limit]
+        return {"tracks": [pack(t) for t in merged]}
+    except Exception: return {"tracks": []}
+
+@app.api_route("/api/stream/{token}", methods=["GET", "HEAD", "OPTIONS"])
+async def stream(token: str, request: Request):
+    url = unsign(token)
+    headers = {}
+    if request.headers.get("range"): headers["Range"] = request.headers["range"]
+    try:
+        req = get_http().build_request("GET", url, headers=headers)
+        upstream = await get_http().send(req, stream=True)
+    except Exception as e: raise HTTPException(status_code=502, detail=f"Proxy error: {e}")
+    out_headers = {"Content-Type": upstream.headers.get("content-type", "audio/mpeg"), "Accept-Ranges": "bytes", "Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=3600"}
+    for h in ("Content-Length", "Content-Range"):
+        if h in upstream.headers: out_headers[h] = upstream.headers[h]
+    if upstream.status_code >= 400: await upstream.aclose(); raise HTTPException(status_code=502, detail="Upstream error")
+    if request.method == "HEAD": await upstream.aclose(); return Response(status_code=upstream.status_code, headers=out_headers)
+    async def gen():
+        try:
+            async for chunk in upstream.aiter_raw(65536): yield chunk
+        finally: await upstream.aclose()
+    return StreamingResponse(gen(), status_code=upstream.status_code, headers=out_headers)
+
+@app.api_route("/api/sc/{sc_id}", methods=["GET", "HEAD", "OPTIONS"])
+async def soundcloud_audio(sc_id: str, request: Request):
+    if not ENABLE_SOUNDCLOUD: raise HTTPException(status_code=503, detail="SoundCloud disabled")
+    try: data = await soundcloud_stream_bytes(sc_id)
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(status_code=502, detail=f"SoundCloud stream error: {e}")
+    headers = {"Content-Type": "audio/mp4", "Accept-Ranges": "bytes", "Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=3600", "Content-Length": str(len(data))}
+    if request.method in ("HEAD", "OPTIONS"): return Response(status_code=200, headers=headers)
+    rng = request.headers.get("range")
+    if rng and rng.startswith("bytes="):
+        try:
+            a_s, b_s = rng[6:].split("-", 1)
+            a = int(a_s) if a_s else 0
+            b = int(b_s) if b_s else len(data) - 1
+            b = min(b, len(data) - 1)
+            if a > b or a >= len(data): return Response(status_code=416, headers={"Content-Range": f"bytes */{len(data)}"})
+            part = data[a:b + 1]
+            h = dict(headers); h["Content-Range"] = f"bytes {a}-{b}/{len(data)}"; h["Content-Length"] = str(len(part))
+            return Response(content=part, status_code=206, headers=h)
+        except ValueError: pass
+    return Response(content=data, status_code=200, headers=headers)
+
+@app.api_route("/api/audio/{ym_id}", methods=["GET", "HEAD", "OPTIONS"])
+async def yandex_audio(ym_id: str, request: Request):
+    def resolve():
+        client = get_ym()
+        if not client: raise Exception("Yandex client not initialized")
+        tracks = client.tracks([ym_id])
+        if not tracks: raise Exception("Track not found")
+        info = tracks[0].get_download_info()
+        if not info: raise Exception("No download info")
+        best = max(info, key=lambda x: x.bitrate_in_kbps or 0)
+        return best.get_direct_link()
+    try: link = await asyncio.to_thread(resolve)
+    except Exception as e: raise HTTPException(status_code=502, detail=str(e))
+    headers = {}
+    if request.headers.get("range"): headers["Range"] = request.headers["range"]
+    req = get_http().build_request("GET", link, headers=headers)
+    upstream = await get_http().send(req, stream=True)
+    out_headers = {"Content-Type": "audio/mpeg", "Accept-Ranges": "bytes", "Access-Control-Allow-Origin": "*"}
+    for h in ("Content-Length", "Content-Range"):
+        if h in upstream.headers: out_headers[h] = upstream.headers[h]
+    if request.method == "HEAD": await upstream.aclose(); return Response(status_code=upstream.status_code, headers=out_headers)
+    async def gen():
+        try:
+            async for chunk in upstream.aiter_raw(65536): yield chunk
+        finally: await upstream.aclose()
+    return StreamingResponse(gen(), status_code=upstream.status_code, headers=out_headers)
+
+@app.api_route("/api/cover/{token}", methods=["GET", "OPTIONS"])
+async def cover(token: str):
+    url = unsign(token)
+    try: r = await get_http().get(url)
+    except Exception: raise HTTPException(status_code=502, detail="Cover fetch failed")
+    if r.status_code != 200: raise HTTPException(status_code=502, detail="Cover upstream error")
+    return Response(content=r.content, media_type=r.headers.get("content-type", "image/jpeg"), headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=86400"})
+
+# ==========================================
+# 4. РАЗДАЧА СТАТИЧЕСКИХ ФАЙЛОВ (САЙТ)
+# ==========================================
+# Этот блок должен быть строго в самом конце, чтобы не перекрывать API!
+app.mount("/", StaticFiles(directory=".", html=True), name="static")
