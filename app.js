@@ -237,7 +237,7 @@
             if (playingTrack && ((playingTrack.title || '') + '|' + (playingTrack.artist || '')).toLowerCase() === key) {
                 playingTrack.cover = image; // Сохраняем в реестр
                 var pc = document.getElementById('playerCover');
-                if (pc) { pc.innerHTML = '<img src="' + esc(image) + '" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:10px">'; pc.style.background = 'none'; }
+                if (pc) { pc.innerHTML = '<img src="' + esc(image) + '" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:50%">'; pc.style.background = 'none'; }
             }
         }
       }).catch(function() {}).then(function(){ delete coverRequests[key]; });
@@ -447,7 +447,6 @@
 
   function playPreview(t) {
     if (previewAudio && previewTrackId === String(t.id)) { if (previewAudio.paused) { previewAudio.play(); setPlayingUI(true); } else { previewAudio.pause(); setPlayingUI(false); } return; }
-    // Проверяем, есть ли уже загруженная картинка в кэше, чтобы сразу подставить в плеер
     var key = ((t.title || '') + '|' + (t.artist || '')).toLowerCase();
     if (trackCoverCache[key]) t.cover = trackCoverCache[key];
     startAudio(t.preview, t); showPlayer(t); setPlayingUI(true);
@@ -461,10 +460,10 @@
   function showPlayer(t) {
     var pl = $('#player'); if(pl) pl.hidden = false; var pt = $('#playerTitle'); if(pt) pt.textContent = t.title; var pa = $('#playerArtist'); if(pa) pa.textContent = t.artist; var c = $('#playerCover');
     if (c) { 
-        // Берем картинку из кэша, если есть
         var key = ((t.title || '') + '|' + (t.artist || '')).toLowerCase();
         var art = trackCoverCache[key] || t.cover || ''; 
-        if (art) { c.innerHTML = '<img src="' + esc(art) + '" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:10px">'; c.style.background = 'none'; } 
+        // ВНЕДРЕН КРУГЛЫЙ ДИЗАЙН ДЛЯ ОБЛОЖКИ В ПЛЕЕРЕ
+        if (art) { c.innerHTML = '<img src="' + esc(art) + '" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:50%">'; c.style.background = 'none'; } 
         else { c.innerHTML = ''; c.style.background = coverColor(String(t.id).length + (t.title || '').length); c.textContent = coverLetter(t.title); } 
     }
     setPlayingUI(true);
