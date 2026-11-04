@@ -3,7 +3,6 @@
 
   var API_URL = ''; 
 
-  // ПРИНУДИТЕЛЬНО ПРЯЧЕМ ПЛЕЕР ПРИ СТАРТЕ
   var pcInit = document.getElementById('playerContainer'); if (pcInit) pcInit.hidden = true;
   var plInit = document.getElementById('player'); if (plInit) plInit.hidden = true;
 
@@ -81,6 +80,19 @@
       else { favs = favs.filter(function(f) { return String(f.id) !== String(tr.id); }); toast('Убрано из любимого'); }
       refreshAll();
     } catch (e) { toast('Ошибка сохранения'); }
+  }
+
+  async function apiSendToChat(tr) {
+    try {
+      var res = await fetch(API_URL + '/api/send_to_chat', {
+        method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, getAuthHeader()),
+        body: JSON.stringify({ id: String(tr.id), title: tr.title, artist: tr.artist, duration: tr.dur || '', cover: tr.cover || '', source: tr.source || '', preview: tr.preview || '' })
+      });
+      if (!res.ok) throw new Error();
+      toast('Трек отправлен в чат!');
+    } catch (e) {
+      toast('Не удалось отправить');
+    }
   }
 
   async function apiCreatePlaylist(name) {
@@ -208,22 +220,24 @@
     var ownCover = trackCoverCache[(String(t.title || '') + '|' + String(t.artist || '')).toLowerCase()] || (t.cover ? absUrl(t.cover) : '') || coverFallback(t);
     t.cover = ownCover;
     var cover = '<img class="track__cover track__cover-image js-track-cover" data-title="' + esc(t.title || '') + '" data-artist="' + esc(t.artist || '') + '" src="' + ownCover + '" alt="" loading="lazy">';
+    
+    // ДОБАВЛЕНА 4-Я КНОПКА (ОТПРАВИТЬ)
     return '<div class="track" data-id="' + esc(String(t.id)) + '">' + cover +
       '<div class="track__meta"><div class="track__title">' + esc(t.title) + '</div><div class="track__artist">' + esc(t.artist) + (t.dur ? ' · ' + esc(t.dur) : '') + '</div></div>' +
-      '<div class="track__actions"><button class="track__btn js-play" title="Играть">' + playSvg() + '</button>' +
+      '<div class="track__actions">' +
+      '<button class="track__btn js-play" title="Играть">' + playSvg() + '</button>' +
       '<button class="track__btn js-fav' + (fav ? ' active' : '') + '" title="В избранное">' + (fav ? '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 20.5s-7.5-4.7-7.5-10A4.2 4.2 0 0 1 12 7.5a4.2 4.2 0 0 1 7.5 3c0 5.3-7.5 10-7.5 10z"/></svg>' : '<svg viewBox="0 0 24 24" fill="none"><path d="M12 20.5s-7.5-4.7-7.5-10A4.2 4.2 0 0 1 12 7.5a4.2 4.2 0 0 1 7.5 3c0 5.3-7.5 10-7.5 10z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>') + '</button>' +
-      '<button class="track__btn js-addpl" title="В плейлист"><svg viewBox="0 0 24 24" fill="none"><path d="M4 7h12M4 12h12M4 17h8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M18 13.5V9l3 1.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="16.5" cy="16" r="2" stroke="currentColor" stroke-width="2"/></svg></button></div></div>';
+      '<button class="track__btn js-send" title="Отправить в чат"><svg viewBox="0 0 24 24" fill="none"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>' +
+      '<button class="track__btn js-addpl" title="В плейлист"><svg viewBox="0 0 24 24" fill="none"><path d="M4 7h12M4 12h12M4 17h8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M18 13.5V9l3 1.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="16.5" cy="16" r="2" stroke="currentColor" stroke-width="2"/></svg></button>' +
+      '</div></div>';
   }
 
   function renderList(container, tracks) { if (!container) return; container.innerHTML = tracks.map(trackHTML).join(''); hydrateTrackCovers(container); updateRowPlayState(); }
 
   // ===== Страницы =====
-  
-  // ОБЪЕДИНЕННАЯ МОЯ МУЗЫКА (Все треки / Любимое)
   function renderMyMusic() { 
     var tracks = (mymusicTab === 'all') ? library : favs; 
     var title = (mymusicTab === 'all') ? 'Моя музыка' : 'Любимое';
-    
     var titleEl = $('#myPageTitle'); if (titleEl) titleEl.textContent = title;
     var el = $('#myEmpty'); if(el) el.hidden = tracks.length > 0; 
     var c = $('#myCount'); if(c) c.textContent = 'Треков: ' + tracks.length; 
@@ -272,7 +286,6 @@
   function openAlbumTracks(albumId) {
     var results = $('#searchResults'); var empty = $('#searchEmpty');
     if(results) results.innerHTML = '<div class="search-hint">Загружаю альбом…</div>'; if(empty) empty.hidden = true;
-    // ИСПРАВЛЕНО: /api/deezer/album/ заменен на /api/itunes/album/
     fetch(API_URL + '/api/itunes/album/' + encodeURIComponent(albumId)).then(function(r) { return r.json(); }).then(function(data) {
       var tracks = (data.tracks || []).map(function(t) {
         var track = { id: 'itunes_' + t.id, title: t.title || 'Без названия', artist: t.artist || '', dur: t.dur || '', cover: absUrl(t.cover || ''), preview: t.preview || '', full: false, source: 'itunes' };
@@ -339,8 +352,10 @@
   if (contentEl) contentEl.addEventListener('click', function (e) {
     var coverEl = e.target.closest('.track__cover'); if (coverEl) { triggerPlay(coverEl.closest('.track')); return; }
     var btn = e.target.closest('.track__btn'); if (!btn) return; var row = btn.closest('.track'); var id = row.getAttribute('data-id'); var tr = findTrack(id);
+    
     if (btn.classList.contains('js-play')) triggerPlay(row);
     else if (btn.classList.contains('js-fav')) { if (!tr) return; btn.disabled = true; apiToggleFav(tr).then(function() { btn.disabled = false; }); }
+    else if (btn.classList.contains('js-send')) { if (!tr) return; btn.disabled = true; apiSendToChat(tr).then(function() { btn.disabled = false; }); }
     else if (btn.classList.contains('js-addpl')) { if (!tr) return; openAddToPlaylist(id); }
   });
 
