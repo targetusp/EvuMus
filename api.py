@@ -3,7 +3,8 @@ import json
 import hashlib
 import hmac
 from urllib.parse import parse_qsl
-from typing import Optional, List
+from typing import Optional
+from contextlib import asynccontextmanager
 
 import asyncpg
 from fastapi import FastAPI, Header, HTTPException, Depends
@@ -13,7 +14,22 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="EvuMusic User Data API")
+# Глобальный пул соединений
+pool: Optional[asyncpg.Pool] = None
+
+# Современный способ управления жизненным циклом приложения (вместо on_event)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global pool
+    # Подключаемся к Neon при старте
+    pool = await asyncpg.create_pool(os.getenv("DATABASE_URL"), min_size=1, max_size=10)
+    print("Connected to Neon DB")
+    yield
+    # Закрываем пул при остановке
+    if pool:
+        await pool.close()
+
+app = FastAPI(title="EvuMusic User Data API", lifespan=lifespan)
 
 # Разрешаем запросы с любых доменов (чтобы Render и локальный тест работали)
 app.add_middleware(
@@ -24,7 +40,6 @@ app.add_middleware(
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Модели данных для приема запросов от сайта
 class TrackData(BaseModel):
@@ -40,20 +55,6 @@ class PlaylistData(BaseModel):
 
 class PlaylistTrackData(TrackData):
     playlist_id: int
-
-pool: Optional[asyncpg.Pool] = None
-
-@app.on_event("startup")
-async def startup():
-    global pool
-    # Подключаемся к Neon
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
-    print("Connected to Neon DB")
-
-@app.on_event("shutdown")
-async def shutdown():
-    if pool:
-        await pool.close()
 
 # Функция проверки подписи Telegram (чтобы хакеры не могли слать левые запросы)
 def verify_telegram_data(init_data: str) -> dict:
