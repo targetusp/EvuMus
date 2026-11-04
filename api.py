@@ -19,11 +19,14 @@ from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from vkmusix import Client as VKClient # НОВЫЙ ИМПОРТ
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+LASTFM_API_KEY = os.getenv("LASTFM_API_KEY", "").strip() # НОВАЯ ПЕРЕМЕННАЯ
+
 ENABLE_MUZOFOND = os.getenv("MUZOFOND", "1") == "1"
 ENABLE_YANDEX = os.getenv("YANDEX", "1") == "1"
 ENABLE_SOUNDCLOUD = os.getenv("SOUNDCLOUD", "1") == "1"
@@ -33,19 +36,16 @@ DEFAULT_SC_CLIENT_ID = "nIjtjiYnjkOhMyh5xrbqEW12DxeJVnic"
 SC_CLIENT_ID = (os.getenv("SC_CLIENT_ID", "") or DEFAULT_SC_CLIENT_ID).strip()
 SC_API = "https://api-v2.soundcloud.com"
 ITUNES_API = "https://itunes.apple.com"
+LASTFM_API = "https://ws.audioscrobbler.com/2.0" # НОВЫЙ API
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
-# --- НОВЫЕ API ДЛЯ ОБЛОЖЕК ---
-THEAUDIODB_API = "https://www.theaudiodb.com/api/v1/json/2"
-MUSICBRAINZ_API = "https://musicbrainz.org/ws/2"
-COVERARTARCHIVE_API = "https://coverartarchive.org"
 
 pool: Optional[asyncpg.Pool] = None
 _http: Optional[httpx.AsyncClient] = None
+_vk_client: Optional[VKClient] = None # Клиент VK
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global pool, _http
+    global pool, _http, _vk_client
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL environment variable is missing")
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
@@ -54,12 +54,20 @@ async def lifespan(app: FastAPI):
         follow_redirects=True,
         headers={"User-Agent": USER_AGENT, "Accept-Language": "ru-RU,ru;q=0.9"},
     )
+    # Инициализация VKMusix (анонимно)
+    try:
+        _vk_client = VKClient()
+        print("[VKMusix] Client initialized anonymously")
+    except Exception as e:
+        print(f"[VKMusix] Init error: {e}")
+    
     print("[API] Connected to Neon DB")
     try:
         yield
     finally:
         if _http: await _http.aclose()
         if pool: await pool.close()
+        if _vk_client: _vk_client.close()
         print("[API] Shutdown complete")
 
 app = FastAPI(title="EvuMusic API", lifespan=lifespan)
@@ -357,7 +365,6 @@ async def search(q: Optional[str] = Query(None), query: Optional[str] = Query(No
                 if key in seen: continue
                 seen.add(key); merged.append(t)
         
-        # ЖЕСТКИЙ ФИЛЬТР: Убираем всё, что не является полным треком
         merged = [t for t in merged if t.get("full") is not False and t.get("source") not in ("itunes", "deezer")]
         
         merged = rank(merged, term)[:limit]
@@ -365,7 +372,7 @@ async def search(q: Optional[str] = Query(None), query: Optional[str] = Query(No
     except Exception: return {"tracks": []}
 
 # ==========================================
-# АЛЬБОМЫ И ОБЛОЖКИ (ITUNES + THEAUDIODB + MUSICBRAINZ)
+# АЛЬБОМЫ И ОБЛОЖКИ (ITUNES + LASTFM + VK)
 # ==========================================
 @app.get("/api/search/albums")
 async def search_albums(q: Optional[str] = Query(None), query: Optional[str] = Query(None), limit: int = Query(30, ge=1, le=50)):
@@ -429,15 +436,14 @@ async def get_album(album_id: str):
         }
     except Exception: raise HTTPException(status_code=502, detail="Could not load album")
 
-
-# --- НОВАЯ МНОГОУРОВНЕВАЯ ФУНКЦИЯ ПОИСКА ОБЛОЖЕК ---
+# --- МНОГОУРОВНЕВЫЙ ПОИСК ОБЛОЖЕК (iTunes -> Last.fm -> VK) ---
 @app.get("/api/track-cover")
 async def get_track_cover(title: str = Query(...), artist: str = Query("")):
     title, artist = norm(title), norm(artist)
     if not title: return {"cover": ""}
     search_query = f"{artist} {title}".strip()
 
-    # 1. Пытаемся найти в iTunes (самый быстрый и надежный для популярной музыки)
+    # 1. iTunes (Apple Music)
     try:
         r = await get_http().get(ITUNES_API + "/search", params={"term": search_query, "entity": "song", "limit": 1})
         if r.status_code == 200:
@@ -447,34 +453,41 @@ async def get_track_cover(title: str = Query(...), artist: str = Query("")):
                 if cover_url: return {"cover": cover_url}
     except Exception: pass
 
-    # 2. Пытаемся найти в TheAudioDB (публичный тестовый ключ "2")
-    try:
-        r = await get_http().get(THEAUDIODB_API + "/searchalbum.php", params={"s": artist, "a": title})
-        if r.status_code == 200:
-            data = r.json()
-            if data and "album" in data and data["album"]:
-                album = data["album"][0]
-                cover_url = album.get("strAlbumThumb") or album.get("strAlbumThumbHQ")
-                if cover_url: return {"cover": cover_url}
-    except Exception: pass
+    # 2. Last.fm (огромная база, включая русскую музыку)
+    if LASTFM_API_KEY:
+        try:
+            r = await get_http().get(LASTFM_API, params={
+                "method": "album.getinfo",
+                "artist": artist,
+                "album": title, # Используем название трека как название альбома (приблизительно)
+                "api_key": LASTFM_API_KEY,
+                "format": "json"
+            })
+            if r.status_code == 200:
+                data = r.json()
+                if "album" in data and "image" in data["album"]:
+                    for img in data["album"]["image"]:
+                        if img.get("size") == "extralarge":
+                            return {"cover": img["#text"]}
+        except Exception: pass
 
-    # 3. Пытаемся найти через MusicBrainz + Cover Art Archive (для андеграунда и ремиксов)
-    try:
-        # Ищем релиз в MusicBrainz
-        r = await get_http().get(MUSICBRAINZ_API + "/release/", params={"query": f"artist:{artist} AND release:{title}", "limit": 1})
-        if r.status_code == 200:
-            data = r.json()
-            releases = data.get("releases", [])
-            if releases:
-                mbid = releases[0].get("id")
-                if mbid:
-                    # Запрашиваем обложку в Cover Art Archive
-                    caa_url = f"{COVERARTARCHIVE_API}/release/{mbid}/front-500"
-                    # Мы не скачиваем картинку, а проверяем, существует ли она (HEAD запрос)
-                    check = await get_http().head(caa_url)
-                    if check.status_code == 200:
-                        return {"cover": caa_url}
-    except Exception: pass
+    # 3. VKMusix (прямой поиск в базе ВКонтакте)
+    if _vk_client:
+        try:
+            # VKMusix синхронный, запускаем в отдельном потоке
+            def vk_search():
+                try:
+                    tracks = _vk_client.searchTracks(query=search_query, limit=1)
+                    if tracks and tracks[0].get("cover"):
+                        return tracks[0]["cover"] # Предполагаем, что поле называется cover
+                except Exception:
+                    pass
+                return None
+            
+            vk_cover = await asyncio.to_thread(vk_search)
+            if vk_cover:
+                return {"cover": vk_cover}
+        except Exception: pass
 
     return {"cover": ""}
 
