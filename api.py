@@ -406,22 +406,34 @@ async def prewarm_sc(sc_id):
         track = r.json()
         trans = (track.get("media") or {}).get("transcodings") or []
 
-        # Progressive streams are directly playable by the HTML audio element.
+        # Prefer formats supported by mobile Safari and Android WebView.
+        # MP3 is the safest common denominator; AAC/MP4 is the next choice.
         progressive = [x for x in trans if x.get("format", {}).get("protocol") == "progressive"]
+        def progressive_priority(item):
+            mime = str((item.get("format") or {}).get("mime_type") or "").lower()
+            if "audio/mpeg" in mime or "audio/mp3" in mime: return 0
+            if "audio/mp4" in mime or "audio/aac" in mime: return 1
+            if "audio/ogg" in mime or "opus" in mime: return 3
+            return 2
+        progressive.sort(key=progressive_priority)
         for item in progressive:
+            mime = str((item.get("format") or {}).get("mime_type") or "").lower()
+            # OGG/Opus is not reliably supported by iOS WebViews; use HLS instead.
+            if "audio/ogg" in mime or "opus" in mime:
+                continue
             try:
                 resolved = await cli.get(item["url"], params=sc_params())
                 if resolved.status_code == 200:
                     direct_url = (resolved.json() or {}).get("url")
                     if direct_url:
-                        _sc_resolve_cache[sc_id] = {"type": "direct", "url": direct_url}
+                        mime = str((item.get("format") or {}).get("mime_type") or "audio/mpeg")
+                        _sc_resolve_cache[sc_id] = {"type": "direct", "url": direct_url, "mime": mime}
                         return
             except (KeyError, httpx.HTTPError, ValueError):
                 continue
 
-        # Some SoundCloud tracks only expose HLS. We only pass fragmented MP4
-        # through when the manifest has an initialization segment; MPEG-TS HLS
-        # cannot be concatenated and played as a normal <audio src> in Chromium.
+        # Keep HLS as HLS. Concatenating .ts/fMP4 fragments into a fake MP4
+        # breaks stricter mobile decoders; the client will use native HLS or hls.js.
         hls = [x for x in trans if x.get("format", {}).get("protocol") == "hls"]
         for item in hls:
             try:
@@ -433,15 +445,8 @@ async def prewarm_sc(sc_id):
                     continue
                 manifest = await cli.get(loc)
                 manifest.raise_for_status()
-                manifest_text = manifest.text
-                init_match = re.search(r'#EXT-X-MAP:URI="([^"]+)"', manifest_text)
-                segments = [line.strip() for line in manifest_text.splitlines()
-                            if line.strip() and not line.lstrip().startswith("#")]
-                if init_match and segments:
-                    _sc_resolve_cache[sc_id] = {
-                        "type": "hls_fmp4", "loc": str(manifest.url),
-                        "init": init_match.group(1), "segs": segments,
-                    }
+                if manifest.text.lstrip().startswith("#EXTM3U"):
+                    _sc_resolve_cache[sc_id] = {"type": "hls", "url": str(manifest.url)}
                     return
             except (httpx.HTTPError, ValueError, KeyError):
                 continue
@@ -457,7 +462,7 @@ async def _proxy_audio_url(url: str, request: Request, default_type: str = "audi
             "Access-Control-Allow-Headers": "Range, Content-Type",
         })
 
-    headers = {"Accept": "audio/*,*/*;q=0.8"}
+    headers = {"Accept": "audio/*,*/*;q=0.8", "Accept-Encoding": "identity"}
     range_header = request.headers.get("range")
     if range_header:
         headers["Range"] = range_header
@@ -473,6 +478,13 @@ async def _proxy_audio_url(url: str, request: Request, default_type: str = "audi
         raise HTTPException(status_code=502, detail=f"Audio provider returned HTTP {status}")
 
     content_type = (upstream.headers.get("content-type") or "").split(";")[0].strip().lower()
+    content_type = {
+        "audio/mp3": "audio/mpeg",
+        "audio/x-mpeg": "audio/mpeg",
+        "audio/mpeg3": "audio/mpeg",
+        "audio/x-m4a": "audio/mp4",
+        "application/mp4": "audio/mp4",
+    }.get(content_type, content_type)
     path = urlparse(url).path.lower()
     if not content_type or content_type in ("application/octet-stream", "binary/octet-stream"):
         if path.endswith((".m4a", ".mp4")):
@@ -498,7 +510,8 @@ async def _proxy_audio_url(url: str, request: Request, default_type: str = "audi
     }
     for name in ("Content-Length", "Content-Range", "Last-Modified", "ETag"):
         value = upstream.headers.get(name)
-        if value:
+        # aiter_bytes() transparently decompresses; do not forward a compressed length.
+        if value and not (name == "Content-Length" and upstream.headers.get("content-encoding", "identity").lower() not in ("", "identity")):
             out_headers[name] = value
     status_code = upstream.status_code
     if method == "HEAD":
@@ -507,7 +520,7 @@ async def _proxy_audio_url(url: str, request: Request, default_type: str = "audi
 
     async def body():
         try:
-            async for chunk in upstream.aiter_raw(64 * 1024):
+            async for chunk in upstream.aiter_bytes(64 * 1024):
                 if chunk:
                     yield chunk
         finally:
@@ -531,32 +544,64 @@ async def soundcloud_audio(sc_id: str, request: Request):
     if not cached:
         raise HTTPException(status_code=415, detail="SoundCloud did not provide a browser-compatible audio stream")
     if cached["type"] == "direct":
-        return await _proxy_audio_url(cached["url"], request, "audio/mpeg")
-    if cached["type"] == "hls_fmp4":
-        if request.method == "HEAD":
-            return Response(status_code=200, headers={
-                "Content-Type": 'audio/mp4; codecs="mp4a.40.2"',
-                "Accept-Ranges": "none", "Access-Control-Allow-Origin": "*",
-            })
-        cli = get_http()
-        async def gen_hls():
-            try:
-                init_resp = await cli.get(urljoin(cached["loc"], cached["init"]))
-                init_resp.raise_for_status()
-                yield init_resp.content
-                for segment in cached.get("segs", []):
-                    segment_resp = await cli.get(urljoin(cached["loc"], segment))
-                    segment_resp.raise_for_status()
-                    yield segment_resp.content
-            except httpx.HTTPError as exc:
-                print(f"[SOUNDCLOUD HLS STREAM ERROR] {exc}")
-                raise
-        return StreamingResponse(gen_hls(), status_code=200, headers={
-            "Content-Type": 'audio/mp4; codecs="mp4a.40.2"',
-            "Accept-Ranges": "none", "Access-Control-Allow-Origin": "*",
-            "Cache-Control": "no-store",
-        })
+        return await _proxy_audio_url(cached["url"], request, cached.get("mime", "audio/mpeg").split(";")[0])
+    if cached["type"] == "hls":
+        return await _serve_hls_manifest(cached["url"])
     raise HTTPException(status_code=415, detail="Unsupported SoundCloud stream format")
+
+@app.get("/api/sc/resolve/{sc_id}")
+async def soundcloud_resolve(sc_id: str):
+    """Resolve SoundCloud before the user presses play; avoids async autoplay loss on phones."""
+    if not ENABLE_SOUNDCLOUD:
+        raise HTTPException(status_code=503, detail="SoundCloud disabled")
+    if sc_id not in _sc_resolve_cache:
+        await prewarm_sc(sc_id)
+    cached = _sc_resolve_cache.get(sc_id)
+    if not cached:
+        raise HTTPException(status_code=415, detail="No compatible SoundCloud stream")
+    if cached["type"] == "direct":
+        return {"type": "direct", "url": "/api/sc/" + sc_id}
+    return {"type": "hls", "url": "/api/hls/" + sign(cached["url"])}
+
+async def _serve_hls_manifest(url: str):
+    """Fetch and rewrite an HLS playlist so every nested playlist/segment uses our proxy."""
+    try:
+        response = await get_http().get(url, headers={"Accept-Encoding": "identity"})
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"HLS manifest error: {exc}")
+    body = response.text
+    if not body.lstrip().startswith("#EXTM3U"):
+        raise HTTPException(status_code=502, detail="Provider returned an invalid HLS manifest")
+    base = str(response.url)
+    output = []
+    def proxy_uri(raw):
+        target = urljoin(base, raw)
+        path = urlparse(target).path.lower()
+        if path.endswith((".m3u8", ".m3u")):
+            return "/api/hls/" + sign(target)
+        return "/api/stream/" + sign(target)
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            output.append(line)
+        elif stripped.startswith("#"):
+            line = re.sub(r'URI="([^"]+)"', lambda m: 'URI="' + proxy_uri(m.group(1)) + '"', line)
+            output.append(line)
+        else:
+            output.append(proxy_uri(stripped))
+    return Response("\n".join(output) + "\n", media_type="application/vnd.apple.mpegurl", headers={
+        "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store",
+        "Access-Control-Expose-Headers": "Content-Length, Content-Type",
+    })
+
+@app.get("/api/hls/{token}")
+async def hls_proxy(token: str):
+    url = unsign(token)
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not (parsed.hostname or "").endswith(("sndcdn.com", "soundcloud.com", "scdn.co")):
+        raise HTTPException(status_code=403, detail="HLS host is not allowed")
+    return await _serve_hls_manifest(url)
 
 _ym_client = None
 def get_ym():
@@ -594,7 +639,12 @@ def _ym_resolve_link(ym_id: str) -> Optional[str]:
     if not tracks: return None
     info = tracks[0].get_download_info()
     if not info: return None
-    return max(info, key=lambda x: x.bitrate_in_kbps or 0).get_direct_link()
+    # Prefer MP3 for maximum compatibility with mobile WebViews.
+    mp3 = [x for x in info if str(getattr(x, "codec", "")).lower() == "mp3"]
+    aac = [x for x in info if str(getattr(x, "codec", "")).lower() in ("aac", "m4a")]
+    candidates = mp3 or aac or info
+    candidates = sorted(candidates, key=lambda x: x.bitrate_in_kbps or 0, reverse=True)
+    return candidates[0].get_direct_link()
 
 async def prewarm_ym(ym_id: str):
     """Заранее резолвит прямую ссылку Яндекс.Музыки, чтобы play стартовал мгновенно."""
@@ -649,7 +699,7 @@ async def search(q: Optional[str] = Query(None), query: Optional[str] = Query(No
         # Медленные источники (Yandex 2-4с) догоняют в фоне и дополняют кеш.
         start = time.monotonic()
         soft_deadline = start + 1.6   # уже есть что показать — не ждём медленных
-        hard_deadline = start + 3.0   # совсем пусто — даём шанс всем источникам
+        hard_deadline = start + 5.0   # пустой результат ждём дольше, чтобы не показывать ложное «не найдено»
         pending = set(tasks)
         while pending and len(merged) < limit:
             now = time.monotonic()
