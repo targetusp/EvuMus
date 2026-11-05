@@ -774,7 +774,17 @@
     var endpoint = API_URL + '/api/sc/resolve/' + encodeURIComponent(id) + (forceRefresh ? '?refresh=true' : '');
     var requestPromise = fetch(endpoint, { cache: 'no-store' })
       .then(function (r) { if (!r.ok) throw new Error('SoundCloud resolve HTTP ' + r.status); return r.json(); })
-      .then(function (data) { scResolveCache[id] = data; if (scResolvePromises[id] === requestPromise) delete scResolvePromises[id]; return data; })
+      .then(function (data) {
+        // An older request must not overwrite a newer forced refresh.
+        if (scResolvePromises[id] === requestPromise) {
+          scResolveCache[id] = data;
+          delete scResolvePromises[id];
+        }
+        if (!data || !data.url || (data.type !== 'direct' && data.type !== 'hls')) {
+          throw new Error('SoundCloud returned an invalid stream response');
+        }
+        return data;
+      })
       .catch(function (error) { if (scResolvePromises[id] === requestPromise) delete scResolvePromises[id]; throw error; });
     scResolvePromises[id] = requestPromise;
     return requestPromise;
@@ -823,7 +833,26 @@
     });
   }
 
-  function startAudio(url, t) {
+  // Повторно получаем свежую ссылку, если SoundCloud отдал устаревший URL
+  // или временно не смог загрузить поток. Не требует повторного выбора трека.
+  function retrySoundCloudPlayback(t, retryCount, reason) {
+    if (!t || t.source !== 'soundcloud' || (retryCount || 0) >= 1) return false;
+    var trackId = String(t.id);
+    var scId = String(t.ext_id || trackId.replace(/^soundcloud_/, ''));
+    console.warn('[EvuMusic] refreshing failed SoundCloud playback:', scId, reason || '');
+    resolveSoundCloud(scId, true).then(function (fresh) {
+      if (previewTrackId !== trackId || !fresh || !fresh.url) return;
+      if (fresh.type === 'hls') startHlsAudio(fresh.url, t, (retryCount || 0) + 1);
+      else startAudio(fresh.url, t, (retryCount || 0) + 1);
+    }).catch(function (error) {
+      console.error('[EvuMusic] SoundCloud playback refresh failed:', error);
+      if (previewTrackId === trackId) toast('SoundCloud временно не смог загрузить трек. Попробуй ещё раз');
+    });
+    return true;
+  }
+
+  function startAudio(url, t, retryCount) {
+    retryCount = retryCount || 0;
     if (!url) {
       toast('У этого трека нет ссылки на аудио');
       setPlayingUI(false);
@@ -866,13 +895,14 @@
     audio.onerror = function () {
       if (previewAudio !== audio) return;
       var code = audio.error ? audio.error.code : 0;
+      setPlayingUI(false);
+      if (retrySoundCloudPlayback(t, retryCount, 'audio element error ' + code)) return;
       var messages = {
         1: 'Загрузка аудио отменена',
         2: 'Проблема сети при загрузке трека',
         3: 'Не удалось декодировать аудио',
         4: 'Источник не отдал поддерживаемый аудиоформат'
       };
-      setPlayingUI(false);
       toast(messages[code] || 'Не удалось загрузить трек');
     };
     audio.ontimeupdate = function () {
@@ -944,6 +974,7 @@
       setPlayingUI(false);
       var err = audio.error;
       console.error('[EvuMusic] HLS media element error:', err && { code: err.code, message: err.message, src: audio.currentSrc });
+      if (retrySoundCloudPlayback(t, retryCount, 'native HLS media error')) return;
       toast(err && err.code === 4 ? 'Браузер не поддерживает кодек этого HLS-потока' : 'Не удалось загрузить HLS-поток');
     };
 
@@ -1116,7 +1147,17 @@
           // the player remains selected and the user can tap Play once more.
           if (resolved.type === 'hls') startHlsAudio(resolved.url, t);
           else startAudio(resolved.url || t.preview, t);
-        }).catch(function (e) { console.error('[EvuMusic] SoundCloud resolve failed:', e); toast('SoundCloud не смог подготовить аудио'); });
+        }).catch(function (e) {
+          console.warn('[EvuMusic] SoundCloud resolve failed; retrying with fresh metadata:', e);
+          resolveSoundCloud(scId, true).then(function (fresh) {
+            if (previewTrackId && previewTrackId !== String(t.id)) return;
+            if (fresh.type === 'hls') startHlsAudio(fresh.url, t);
+            else startAudio(fresh.url || t.preview, t);
+          }).catch(function (retryError) {
+            console.error('[EvuMusic] SoundCloud resolve retry failed:', retryError);
+            if (previewTrackId === String(t.id)) toast('SoundCloud временно не смог подготовить трек. Попробуй ещё раз');
+          });
+        });
       }
       return;
     }
