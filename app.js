@@ -415,7 +415,8 @@
     // Прогреваем только первые два URL диапазонным запросом. Полная
     // предзагрузка Audio-элементов на каждом поиске создавала лишний трафик
     // и конкурировала с фактическим воспроизведением.
-    tracks.slice(0, 2).forEach(function(t) { if (t.preview) warmUrl(t.preview); });
+    if (!isMobileAudio) tracks.slice(0, 2).forEach(function(t) { if (t.preview) warmUrl(t.preview); });
+    warmSoundCloud(tracks);
     // Наведение на трек = прогрев его ссылки, клик играет без задержки
     container.querySelectorAll('.track').forEach(function(row) {
       var t = trackRegistry[row.getAttribute('data-id')];
@@ -459,10 +460,28 @@
       return;
     }
 
-    function paint(tracks) {
+    var emptyRetryStarted = false;
+    function paint(tracks, finalAttempt) {
       if (reqId !== searchRequestId) return;
+      tracks = tracks || [];
       tracks.forEach(registerTrack);
-      if (!tracks || !tracks.length) {
+      if (!tracks.length) {
+        if (!finalAttempt && !emptyRetryStarted) {
+          emptyRetryStarted = true;
+          if (empty) { empty.hidden = false; empty.innerHTML = '<p>Проверяю остальные источники…</p>'; }
+          res.innerHTML = '<div class="search-hint">Ищу треки…</div>';
+          setTimeout(function () {
+            if (reqId !== searchRequestId || inputValue() !== q) return;
+            var retry = new AbortController();
+            searchController = retry;
+            fetchTracks(q, retry.signal).then(function (again) { paint(again, true); }).catch(function (error) {
+              if (reqId !== searchRequestId || (error && error.name === 'AbortError')) return;
+              if (empty) { empty.hidden = false; empty.innerHTML = '<p>Не удалось выполнить поиск</p>'; }
+              res.innerHTML = '';
+            });
+          }, 1100);
+          return;
+        }
         if (empty) { empty.hidden = false; empty.innerHTML = '<p>Ничего не найдено по «' + esc(q) + '»</p>'; }
         res.innerHTML = '';
         return;
@@ -480,19 +499,11 @@
       if (!res.children.length) res.innerHTML = '<div class="search-hint">Ищу треки…</div>';
       searchController = new AbortController();
       var controller = searchController;
-      fetchTracks(q, controller.signal).then(paint).catch(function (error) {
+      fetchTracks(q, controller.signal).then(function (tracks) { paint(tracks, false); }).catch(function (error) {
         if (reqId !== searchRequestId || (error && error.name === 'AbortError')) return;
         if (empty) { empty.hidden = false; empty.innerHTML = '<p>Не удалось выполнить поиск</p>'; }
         if (!res.children.length || res.querySelector('.search-hint')) res.innerHTML = '';
         console.error('[EvuMusic] search failed:', error);
-      }).then(function () {
-        if (reqId !== searchRequestId) return;
-        if (!searchCache[q] || !searchCache[q].length) {
-          setTimeout(function () {
-            if (reqId !== searchRequestId || inputValue() !== q) return;
-            revalidateTracks(q);
-          }, 1800);
-        }
       });
     }
     renderCollection();
@@ -747,7 +758,43 @@
 
   // ===== Плеер =====
   var previewAudio = null; var previewTrackId = null; var playerState = { playing: false };
+  var activeHls = null;
+  var scResolveCache = Object.create(null);
+  var scResolvePromises = Object.create(null);
+  var hlsLibraryPromise = null;
+  var isMobileAudio = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) || (window.Telegram && window.Telegram.WebApp);
   window.__evuAudio = function () { return previewAudio; };
+
+  function resolveSoundCloud(id) {
+    id = String(id);
+    if (scResolveCache[id]) return Promise.resolve(scResolveCache[id]);
+    if (scResolvePromises[id]) return scResolvePromises[id];
+    scResolvePromises[id] = fetch(API_URL + '/api/sc/resolve/' + encodeURIComponent(id))
+      .then(function (r) { if (!r.ok) throw new Error('SoundCloud resolve HTTP ' + r.status); return r.json(); })
+      .then(function (data) { scResolveCache[id] = data; delete scResolvePromises[id]; return data; })
+      .catch(function (error) { delete scResolvePromises[id]; throw error; });
+    return scResolvePromises[id];
+  }
+
+  function loadHlsLibrary() {
+    if (window.Hls) return Promise.resolve(window.Hls);
+    if (hlsLibraryPromise) return hlsLibraryPromise;
+    hlsLibraryPromise = new Promise(function (resolve, reject) {
+      var script = document.createElement('script');
+      script.src = 'https://cdn.jsdelivr.net/npm/hls.js@1.5.18/dist/hls.min.js';
+      script.async = true;
+      script.onload = function () { window.Hls ? resolve(window.Hls) : reject(new Error('HLS library unavailable')); };
+      script.onerror = function () { reject(new Error('Could not load HLS library')); };
+      document.head.appendChild(script);
+    });
+    return hlsLibraryPromise;
+  }
+
+  function warmSoundCloud(tracks) {
+    (tracks || []).filter(function (t) { return t.source === 'soundcloud'; }).slice(0, 12).forEach(function (t) {
+      resolveSoundCloud(String(t.id).replace(/^soundcloud_/, '')).catch(function (e) { console.warn('[EvuMusic] SoundCloud pre-resolve:', e); });
+    });
+  }
 
   function startAudio(url, t) {
     if (!url) {
@@ -755,20 +802,23 @@
       setPlayingUI(false);
       return;
     }
+    if (activeHls) { try { activeHls.destroy(); } catch (e) {} activeHls = null; }
     if (previewAudio) {
       previewAudio.pause();
       previewAudio.onplaying = previewAudio.onwaiting = previewAudio.onerror = null;
       try { previewAudio.removeAttribute('src'); previewAudio.load(); } catch (e) {}
     }
     previewTrackId = String(t.id);
-    previewAudio = preloadedAudios[url] || new Audio();
+    previewAudio = (!isMobileAudio && preloadedAudios[url]) || new Audio();
     delete preloadedAudios[url];
     var audio = previewAudio;
-    audio.preload = 'auto';
+    audio.preload = isMobileAudio ? 'metadata' : 'auto';
+    audio.setAttribute('playsinline', '');
+    audio.setAttribute('webkit-playsinline', '');
     audio.volume = volume / 100;
     var absoluteUrl = new URL(url, window.location.href).href;
-    if (audio.src !== absoluteUrl) audio.src = url;
-    try { audio.currentTime = 0; } catch (e) {}
+    audio.src = absoluteUrl;
+    try { audio.load(); audio.currentTime = 0; } catch (e) {}
     showPlayer(t);
     setPlayingUI(false);
     var activeRow = $$('.track').find(function (row) { return row.getAttribute('data-id') === previewTrackId; });
@@ -840,10 +890,71 @@
     }
   }
 
+  function startHlsAudio(url, t) {
+    if (activeHls) { try { activeHls.destroy(); } catch (e) {} activeHls = null; }
+    if (previewAudio) {
+      previewAudio.pause();
+      try { previewAudio.removeAttribute('src'); previewAudio.load(); } catch (e) {}
+    }
+    previewTrackId = String(t.id);
+    var audio = new Audio();
+    previewAudio = audio;
+    audio.preload = 'metadata';
+    audio.setAttribute('playsinline', '');
+    audio.setAttribute('webkit-playsinline', '');
+    audio.volume = volume / 100;
+    showPlayer(t);
+    setPlayingUI(false);
+    audio.onplaying = function () { if (previewAudio === audio) setPlayingUI(true); };
+    audio.onerror = function () {
+      if (previewAudio !== audio) return;
+      setPlayingUI(false);
+      console.error('[EvuMusic] HLS audio error:', audio.error && { code: audio.error.code, message: audio.error.message });
+      toast('Не удалось загрузить HLS-аудио. Попробуй другой источник');
+    };
+    if (audio.canPlayType('application/vnd.apple.mpegurl')) {
+      audio.src = new URL(url, location.href).href;
+      audio.load();
+      var nativePlay = audio.play();
+      if (nativePlay && nativePlay.catch) nativePlay.catch(function (e) { console.error('[EvuMusic] native HLS play:', e); toast('Браузер не разрешил запуск. Нажми Play ещё раз'); });
+      return;
+    }
+    loadHlsLibrary().then(function (Hls) {
+      if (previewAudio !== audio) return;
+      if (!Hls.isSupported()) throw new Error('HLS/MSE is not supported by this browser');
+      var hls = new Hls({ enableWorker: true, lowLatencyMode: false, backBufferLength: 30, maxBufferLength: 30 });
+      activeHls = hls;
+      hls.attachMedia(audio);
+      hls.on(Hls.Events.MEDIA_ATTACHED, function () { hls.loadSource(new URL(url, location.href).href); });
+      hls.on(Hls.Events.MANIFEST_PARSED, function () {
+        if (previewAudio !== audio) return;
+        var p = audio.play();
+        if (p && p.catch) p.catch(function (e) { console.error('[EvuMusic] HLS play rejected:', e); toast('Нажми Play ещё раз для запуска'); });
+      });
+      hls.on(Hls.Events.ERROR, function (_event, data) {
+        console.error('[EvuMusic] HLS error:', data);
+        if (data && data.fatal && previewAudio === audio) {
+          setPlayingUI(false);
+          try { hls.destroy(); } catch (e) {}
+          activeHls = null;
+          toast('Ошибка HLS-потока. Попробуй другой источник');
+        }
+      });
+    }).catch(function (e) {
+      console.error('[EvuMusic] HLS initialization failed:', e);
+      if (previewAudio === audio) toast('Этот браузер не поддерживает поток SoundCloud');
+    });
+  }
+
   function playPreview(t) {
     if (!t || !t.preview) {
       toast('Ссылка на аудио не найдена');
       return;
+    }
+    if (previewAudio && previewTrackId === String(t.id) && previewAudio.error) {
+      if (activeHls) { try { activeHls.destroy(); } catch (e) {} activeHls = null; }
+      previewAudio = null;
+      previewTrackId = null;
     }
     if (previewAudio && previewTrackId === String(t.id)) {
       if (previewAudio.paused) {
@@ -861,6 +972,18 @@
     }
     var key = ((t.title || '') + '|' + (t.artist || '')).toLowerCase();
     if (trackCoverCache[key]) t.cover = trackCoverCache[key];
+    if (t.source === 'soundcloud') {
+      var scId = String(t.id).replace(/^soundcloud_/, '');
+      if (scResolveCache[scId]) {
+        var resolved = scResolveCache[scId];
+        if (resolved.type === 'hls') startHlsAudio(resolved.url, t);
+        else startAudio(resolved.url || t.preview, t);
+      } else {
+        toast('Подготавливаю аудио. Нажми Play ещё раз через секунду');
+        resolveSoundCloud(scId).catch(function (e) { console.error('[EvuMusic] SoundCloud resolve failed:', e); toast('SoundCloud не смог подготовить аудио'); });
+      }
+      return;
+    }
     startAudio(t.preview, t);
   }
 
@@ -902,7 +1025,7 @@
     }
     setPlayingUI(true);
   }
-  function stopPreview() { if (previewAudio) { previewAudio.pause(); previewAudio = null; previewTrackId = null; } }
+  function stopPreview() { if (activeHls) { try { activeHls.destroy(); } catch (e) {} activeHls = null; } if (previewAudio) { previewAudio.pause(); previewAudio = null; previewTrackId = null; } }
 
   var queueIds = []; function queueTracks() { return queueIds.map(function (id) { return trackRegistry[id] || favs.find(function (f) { return String(f.id) === id; }); }).filter(Boolean); }
   var pPrev = $('#playerPrev'); if (pPrev) pPrev.addEventListener('click', function () { if (!previewAudio || !previewTrackId) return; var q = queueTracks(); var idx = q.findIndex(function (t) { return String(t.id) === String(previewTrackId); }); if (idx > 0) { playPreview(q[idx - 1]); return; } try { previewAudio.currentTime = 0; } catch (e) {} if (previewAudio.paused) { previewAudio.play().catch(function () {}); } var p = $('#playerProgress'); if(p) p.style.width = '0%'; setPlayingUI(true); });
