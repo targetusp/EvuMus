@@ -259,24 +259,25 @@
     if (tr.preview) return true;
     if (restorePromises[tr.id]) return await restorePromises[tr.id];
     restorePromises[tr.id] = (async function () {
-      if (!silent) toast('Восстанавливаю ссылку...');
+      if (!silent) toast('Ищу полную версию трека...');
       try {
-        var response = await fetch(API_URL + '/api/search?q=' + encodeURIComponent((tr.artist || '') + ' ' + tr.title));
-        if (!response.ok) throw new Error('Search HTTP ' + response.status);
-        var data = await response.json();
-        var candidates = data && Array.isArray(data.tracks) ? data.tracks : [];
-        var wantedTitle = String(tr.title || '').trim().toLowerCase();
-        var wantedArtist = String(tr.artist || '').trim().toLowerCase();
-        var newTrack = candidates.find(function (candidate) {
-          return candidate && candidate.preview &&
-            String(candidate.title || '').trim().toLowerCase() === wantedTitle &&
-            (!wantedArtist || String(candidate.artist || '').trim().toLowerCase() === wantedArtist);
-        }) || candidates.find(function (candidate) { return candidate && candidate.preview; });
-        if (!newTrack || !newTrack.preview) throw new Error('No playable result');
+        var params = new URLSearchParams({ title: tr.title || '', artist: tr.artist || '', duration: String(tr.duration || 0) });
+        var response = await fetch(API_URL + '/api/track/resolve?' + params.toString());
+        if (!response.ok) {
+          var errorData = {}; try { errorData = await response.json(); } catch (_) {}
+          throw new Error(errorData.detail || ('Resolve HTTP ' + response.status));
+        }
+        var newTrack = await response.json();
+        if (!newTrack || !newTrack.preview || newTrack.full === false) throw new Error('Full version is unavailable');
         var oldId = tr.id;
-        tr.preview = newTrack.preview;
+        tr.preview = absUrl(newTrack.preview);
+        tr.stream_url = tr.preview;
+        tr.preview_url = tr.preview;
         tr.cover = newTrack.cover || tr.cover;
         tr.source = newTrack.source || tr.source;
+        tr.ext_id = newTrack.ext_id || '';
+        tr.ym_id = newTrack.ym_id || '';
+        tr.full = true;
         trackRegistry[oldId] = tr;
         fetch(API_URL + '/api/update_preview', {
           method: 'POST',
@@ -562,7 +563,7 @@
 
     function render(data) {
       var tracks = (data.tracks || []).map(function(t) {
-        var track = { id: 'itunes_' + t.id, title: t.title || 'Без названия', artist: t.artist || '', dur: t.dur || '', cover: absUrl(t.cover || ''), preview: t.preview || '', full: false, source: 'itunes' };
+        var track = { id: 'itunes_' + t.id, title: t.title || 'Без названия', artist: t.artist || '', dur: t.dur || '', cover: absUrl(t.cover || ''), preview: '', duration: t.duration || 0, full: false, source: 'itunes' };
         registerTrack(track); return track;
       });
       if(results) {
@@ -1076,7 +1077,7 @@
     var key = ((t.title || '') + '|' + (t.artist || '')).toLowerCase();
     if (trackCoverCache[key]) t.cover = trackCoverCache[key];
     if (t.source === 'soundcloud') {
-      var scId = String(t.id).replace(/^soundcloud_/, '');
+      var scId = String(t.ext_id || String(t.id).replace(/^soundcloud_/, ''));
       if (scResolveCache[scId]) {
         var resolved = scResolveCache[scId];
         if (resolved.type === 'hls') startHlsAudio(resolved.url, t);
