@@ -399,76 +399,126 @@ async def soundcloud_search(query: str, limit: int) -> list:
     except Exception: return []
 
 async def _prewarm_sc_impl(sc_id):
-    """Resolve SoundCloud to a browser-playable progressive stream when possible."""
+    """Resolve SoundCloud to a browser-playable stream, retrying transient API failures."""
     sc_id = str(sc_id)
     if sc_id in _sc_resolve_cache:
         return
-    try:
-        cli = get_http()
-        r = await cli.get(SC_API + "/tracks/" + sc_id, params=sc_params())
-        if r.status_code != 200:
-            print(f"[SOUNDCLOUD RESOLVE] {sc_id}: track endpoint HTTP {r.status_code}: {r.text[:300]}")
-            return
-        track = r.json()
-        trans = (track.get("media") or {}).get("transcodings") or []
-        # SoundCloud requires track_authorization for some private, age-gated,
-        # and newer stream endpoints. The token is returned with track metadata.
-        authorization = str(track.get("track_authorization") or "").strip()
-        resolve_params = sc_params()
-        if authorization:
-            resolve_params["track_authorization"] = authorization
-        if not trans:
-            print(f"[SOUNDCLOUD RESOLVE] {sc_id}: track metadata has no transcodings; status={r.status_code}")
-            return
 
-        # Prefer formats supported by mobile Safari and Android WebView.
-        # MP3 is the safest common denominator; AAC/MP4 is the next choice.
-        progressive = [x for x in trans if x.get("format", {}).get("protocol") == "progressive"]
-        def progressive_priority(item):
-            mime = str((item.get("format") or {}).get("mime_type") or "").lower()
-            if "audio/mpeg" in mime or "audio/mp3" in mime: return 0
-            if "audio/mp4" in mime or "audio/aac" in mime: return 1
-            if "audio/ogg" in mime or "opus" in mime: return 3
-            return 2
-        progressive.sort(key=progressive_priority)
-        for item in progressive:
-            mime = str((item.get("format") or {}).get("mime_type") or "").lower()
-            # OGG/Opus is not reliably supported by iOS WebViews; use HLS instead.
-            if "audio/ogg" in mime or "opus" in mime:
-                continue
+    cli = get_http()
+    track = None
+    # SoundCloud can intermittently return 429/5xx or an incomplete response.
+    for attempt in range(3):
+        try:
+            response = await cli.get(
+                SC_API + "/tracks/" + sc_id,
+                params=sc_params(),
+                headers={"Accept": "application/json"},
+                timeout=httpx.Timeout(connect=8.0, read=18.0, write=10.0, pool=8.0),
+            )
+            if response.status_code == 200:
+                track = response.json()
+                if isinstance(track, dict) and (track.get("media") or {}).get("transcodings"):
+                    break
+                print(f"[SOUNDCLOUD RESOLVE] {sc_id}: incomplete track metadata")
+            else:
+                print(f"[SOUNDCLOUD RESOLVE] {sc_id}: track endpoint HTTP {response.status_code}: {response.text[:200]}")
+                if response.status_code not in (408, 425, 429) and response.status_code < 500:
+                    return
+        except (httpx.HTTPError, ValueError) as exc:
+            print(f"[SOUNDCLOUD RESOLVE] {sc_id}: metadata attempt {attempt + 1} failed: {exc}")
+        if attempt < 2:
+            await asyncio.sleep(0.35 * (attempt + 1))
+
+    if not isinstance(track, dict):
+        return
+
+    trans = (track.get("media") or {}).get("transcodings") or []
+    authorization = str(track.get("track_authorization") or "").strip()
+    resolve_params = sc_params()
+    if authorization:
+        resolve_params["track_authorization"] = authorization
+    if not trans:
+        print(f"[SOUNDCLOUD RESOLVE] {sc_id}: track metadata has no transcodings")
+        return
+
+    def mime_of(item):
+        return str((item.get("format") or {}).get("mime_type") or "").lower()
+
+    progressive = [x for x in trans if (x.get("format") or {}).get("protocol") == "progressive"]
+    def progressive_priority(item):
+        mime = mime_of(item)
+        if "audio/mpeg" in mime or "audio/mp3" in mime:
+            return 0
+        if "audio/mp4" in mime or "audio/aac" in mime:
+            return 1
+        if "audio/ogg" in mime or "opus" in mime:
+            return 3
+        return 2
+
+    progressive.sort(key=progressive_priority)
+    # Try every compatible progressive transcoding, not just the first one.
+    for item in progressive:
+        mime = mime_of(item)
+        if "audio/ogg" in mime or "opus" in mime:
+            continue
+        endpoint = item.get("url")
+        if not endpoint:
+            continue
+        for attempt in range(2):
             try:
-                resolved = await cli.get(item["url"], params=resolve_params)
+                resolved = await cli.get(endpoint, params=resolve_params)
                 if resolved.status_code == 200:
                     direct_url = (resolved.json() or {}).get("url")
                     if direct_url:
-                        mime = str((item.get("format") or {}).get("mime_type") or "audio/mpeg")
-                        _sc_resolve_cache[sc_id] = {"type": "direct", "url": direct_url, "mime": mime}
+                        _sc_resolve_cache[sc_id] = {
+                            "type": "direct",
+                            "url": direct_url,
+                            "mime": mime or "audio/mpeg",
+                        }
                         return
-            except (KeyError, httpx.HTTPError, ValueError):
-                continue
+                if resolved.status_code not in (408, 425, 429) and resolved.status_code < 500:
+                    break
+            except (httpx.HTTPError, ValueError, KeyError) as exc:
+                print(f"[SOUNDCLOUD RESOLVE] {sc_id}: progressive attempt failed: {exc}")
+            if attempt == 0:
+                await asyncio.sleep(0.25)
 
-        # Keep HLS as HLS. Concatenating .ts/fMP4 fragments into a fake MP4
-        # breaks stricter mobile decoders; the client will use native HLS or hls.js.
-        hls = [x for x in trans if x.get("format", {}).get("protocol") == "hls"]
-        for item in hls:
+    # HLS is the compatibility fallback for Safari/iOS and tracks without
+    # a usable progressive stream. Keep the playlist intact; never fake an MP4.
+    hls = [x for x in trans if (x.get("format") or {}).get("protocol") == "hls"]
+    for item in hls:
+        endpoint = item.get("url")
+        if not endpoint:
+            continue
+        for attempt in range(2):
             try:
-                resolved = await cli.get(item["url"], params=resolve_params)
+                resolved = await cli.get(endpoint, params=resolve_params)
                 if resolved.status_code != 200:
+                    if resolved.status_code not in (408, 425, 429) and resolved.status_code < 500:
+                        break
+                    if attempt == 0:
+                        await asyncio.sleep(0.25)
                     continue
                 loc = (resolved.json() or {}).get("url")
                 if not loc:
-                    continue
-                manifest = await cli.get(loc)
+                    break
+                manifest = await cli.get(
+                    loc,
+                    headers={"Accept": "application/vnd.apple.mpegurl,application/x-mpegURL,*/*"},
+                    timeout=httpx.Timeout(connect=8.0, read=25.0, write=10.0, pool=8.0),
+                )
                 manifest.raise_for_status()
-                if manifest.text.lstrip().startswith("#EXTM3U"):
+                if manifest.text.lstrip("\\ufeff\\n\\r ").startswith("#EXTM3U"):
                     _sc_resolve_cache[sc_id] = {"type": "hls", "url": str(manifest.url)}
                     return
+                print(f"[SOUNDCLOUD RESOLVE] {sc_id}: HLS response is not a playlist")
+                break
             except (httpx.HTTPError, ValueError, KeyError) as exc:
-                print(f"[SOUNDCLOUD RESOLVE] {sc_id}: HLS transcoding failed: {type(exc).__name__}: {exc}")
-                continue
-        print(f"[SOUNDCLOUD RESOLVE] {sc_id}: no usable progressive or HLS transcoding (count={len(trans)})")
-    except Exception as exc:
-        print(f"[SOUNDCLOUD RESOLVE ERROR] {sc_id}: {exc}")
+                print(f"[SOUNDCLOUD RESOLVE] {sc_id}: HLS attempt {attempt + 1} failed: {type(exc).__name__}: {exc}")
+                if attempt == 0:
+                    await asyncio.sleep(0.25)
+
+    print(f"[SOUNDCLOUD RESOLVE] {sc_id}: no usable progressive or HLS transcoding (count={len(trans)})")
 
 async def prewarm_sc(sc_id):
     """Coalesce simultaneous requests so background warm-up and Play share one resolve."""
