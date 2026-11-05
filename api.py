@@ -468,7 +468,11 @@ async def _proxy_audio_url(url: str, request: Request, default_type: str = "audi
         headers["Range"] = range_header
     method = "HEAD" if request.method == "HEAD" else "GET"
     try:
-        upstream = await cli.send(cli.build_request(method, url, headers=headers), stream=(method != "HEAD"))
+        timeout = httpx.Timeout(connect=10.0, read=45.0, write=15.0, pool=10.0)
+        upstream = await cli.send(
+            cli.build_request(method, url, headers=headers, timeout=timeout),
+            stream=(method != "HEAD"),
+        )
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"Audio upstream error: {exc}")
 
@@ -564,42 +568,70 @@ async def soundcloud_resolve(sc_id: str):
     return {"type": "hls", "url": "/api/hls/" + sign(cached["url"])}
 
 async def _serve_hls_manifest(url: str):
-    """Fetch and rewrite an HLS playlist so every nested playlist/segment uses our proxy."""
+    """Fetch an HLS playlist and rewrite every playlist/key/map/segment URL through this API."""
     try:
-        response = await get_http().get(url, headers={"Accept-Encoding": "identity"})
+        timeout = httpx.Timeout(connect=10.0, read=35.0, write=15.0, pool=10.0)
+        response = await get_http().get(url, headers={"Accept-Encoding": "identity"}, timeout=timeout)
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"HLS manifest error: {exc}")
-    body = response.text
-    if not body.lstrip().startswith("#EXTM3U"):
-        raise HTTPException(status_code=502, detail="Provider returned an invalid HLS manifest")
+        raise HTTPException(status_code=502, detail=f"HLS manifest fetch failed: {type(exc).__name__}: {exc}")
+
+    body = response.text.lstrip("\ufeff\n\r ")
+    if not body.startswith("#EXTM3U"):
+        content_type = response.headers.get("content-type", "unknown")
+        raise HTTPException(status_code=502, detail=f"Invalid HLS manifest (content-type: {content_type})")
+
     base = str(response.url)
     output = []
-    def proxy_uri(raw):
-        target = urljoin(base, raw)
-        path = urlparse(target).path.lower()
+
+    def proxy_uri(raw: str) -> str:
+        target = urljoin(base, raw.strip())
+        parsed = urlparse(target)
+        if parsed.scheme not in ("http", "https"):
+            raise HTTPException(status_code=502, detail="Unsupported HLS resource URL")
+        path = (parsed.path or "").lower()
+        # A playlist URI may have auth query parameters, so inspect only the path.
         if path.endswith((".m3u8", ".m3u")):
             return "/api/hls/" + sign(target)
         return "/api/stream/" + sign(target)
-    for line in body.splitlines():
-        stripped = line.strip()
+
+    uri_attr = re.compile(r'URI=("|\')(.*?)\1', re.IGNORECASE)
+    for raw_line in body.splitlines():
+        stripped = raw_line.strip()
         if not stripped:
-            output.append(line)
+            output.append("")
         elif stripped.startswith("#"):
-            line = re.sub(r'URI="([^"]+)"', lambda m: 'URI="' + proxy_uri(m.group(1)) + '"', line)
-            output.append(line)
+            # Covers EXT-X-KEY, EXT-X-MAP, EXT-X-MEDIA, SESSION-KEY, etc.
+            output.append(uri_attr.sub(lambda m: "URI=" + m.group(1) + proxy_uri(m.group(2)) + m.group(1), raw_line))
         else:
             output.append(proxy_uri(stripped))
-    return Response("\n".join(output) + "\n", media_type="application/vnd.apple.mpegurl", headers={
-        "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store",
-        "Access-Control-Expose-Headers": "Content-Length, Content-Type",
-    })
 
-@app.get("/api/hls/{token}")
-async def hls_proxy(token: str):
+    return Response(
+        "\n".join(output) + "\n",
+        media_type="application/vnd.apple.mpegurl",
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "Range, Content-Type",
+            "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type",
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+@app.api_route("/api/hls/{token}", methods=["GET", "HEAD", "OPTIONS"])
+async def hls_proxy(token: str, request: Request):
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "Range, Content-Type",
+        })
     url = unsign(token)
     parsed = urlparse(url)
-    if parsed.scheme != "https" or not (parsed.hostname or "").endswith(("sndcdn.com", "soundcloud.com", "scdn.co")):
+    host = (parsed.hostname or "").lower()
+    allowed = ("sndcdn.com", "soundcloud.com", "scdn.co")
+    if parsed.scheme != "https" or not any(host == suffix or host.endswith("." + suffix) for suffix in allowed):
         raise HTTPException(status_code=403, detail="HLS host is not allowed")
     return await _serve_hls_manifest(url)
 
