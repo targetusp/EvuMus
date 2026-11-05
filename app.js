@@ -255,6 +255,39 @@
   var restorePromises = {};
   var isRestoringAll = false;
 
+  // Recover an unavailable saved SoundCloud track from another full source.
+  var alternativeResolvePromises = {};
+  async function recoverSoundCloudAlternative(tr, reason) {
+    if (!tr || tr.source !== 'soundcloud') return false;
+    var key = String(tr.id);
+    if (alternativeResolvePromises[key]) return alternativeResolvePromises[key];
+    alternativeResolvePromises[key] = (async function () {
+      try {
+        console.warn('[EvuMusic] resolving SoundCloud favorite from another source:', key, reason || '');
+        var duration = Number(tr.duration) || parseDuration(tr.dur || tr.duration) || 0;
+        var params = new URLSearchParams({ title: tr.title || '', artist: tr.artist || '', duration: String(duration), exclude_source: 'soundcloud' });
+        var response = await fetch(API_URL + '/api/track/resolve?' + params.toString(), { cache: 'no-store' });
+        if (!response.ok) throw new Error('Alternative source HTTP ' + response.status);
+        var found = await response.json();
+        if (!found || !found.preview || found.full === false || found.source === 'soundcloud') throw new Error('No playable alternative source');
+        tr.preview = absUrl(found.preview); tr.preview_url = tr.preview; tr.stream_url = tr.preview;
+        tr.source = found.source || tr.source; tr.ext_id = found.ext_id || ''; tr.ym_id = found.ym_id || '';
+        tr.duration = found.duration || duration; tr.dur = tr.dur || found.dur || '';
+        tr.cover = found.cover ? absUrl(found.cover) : tr.cover; tr.full = true; trackRegistry[key] = tr;
+        fetch(API_URL + '/api/update_preview', {
+          method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, getAuthHeader()),
+          body: JSON.stringify({ id: key, title: tr.title, artist: tr.artist, preview: tr.preview, source: tr.source })
+        }).catch(function (e) { console.warn('[EvuMusic] alternative source save failed:', e); });
+        if (activeHls) { try { activeHls.destroy(); } catch (e) {} activeHls = null; }
+        if (previewAudio) { try { previewAudio.pause(); previewAudio.removeAttribute('src'); previewAudio.load(); } catch (e) {} }
+        previewAudio = null; previewTrackId = null; playPreview(tr);
+        toast('SoundCloud недоступен — запускаю через другой источник');
+        return true;
+      } catch (e) { console.warn('[EvuMusic] alternative source recovery failed:', e); return false; }
+    })();
+    try { return await alternativeResolvePromises[key]; } finally { delete alternativeResolvePromises[key]; }
+  }
+
   async function restorePreview(tr, silent) {
     if (tr.preview) return true;
     if (restorePromises[tr.id]) return await restorePromises[tr.id];
@@ -282,7 +315,7 @@
         fetch(API_URL + '/api/update_preview', {
           method: 'POST',
           headers: Object.assign({ 'Content-Type': 'application/json' }, getAuthHeader()),
-          body: JSON.stringify({ id: String(oldId), title: tr.title, artist: tr.artist, preview: tr.preview })
+          body: JSON.stringify({ id: String(oldId), title: tr.title, artist: tr.artist, preview: tr.preview, source: tr.source })
         }).catch(function (error) { console.warn('[EvuMusic] preview save failed:', error); });
         return true;
       } catch (error) {
@@ -836,7 +869,13 @@
   // Повторно получаем свежую ссылку, если SoundCloud отдал устаревший URL
   // или временно не смог загрузить поток. Не требует повторного выбора трека.
   function retrySoundCloudPlayback(t, retryCount, reason) {
-    if (!t || t.source !== 'soundcloud' || (retryCount || 0) >= 1) return false;
+    if (!t || t.source !== 'soundcloud') return false;
+    if ((retryCount || 0) >= 1) {
+      recoverSoundCloudAlternative(t, reason || 'SoundCloud stream failed').then(function (ok) {
+        if (!ok && previewTrackId === String(t.id)) toast('SoundCloud не смог воспроизвести трек, другой источник не найден');
+      });
+      return true;
+    }
     var trackId = String(t.id);
     var scId = String(t.ext_id || trackId.replace(/^soundcloud_/, ''));
     console.warn('[EvuMusic] refreshing failed SoundCloud playback:', scId, reason || '');
@@ -846,7 +885,9 @@
       else startAudio(fresh.url, t, (retryCount || 0) + 1);
     }).catch(function (error) {
       console.error('[EvuMusic] SoundCloud playback refresh failed:', error);
-      if (previewTrackId === trackId) toast('SoundCloud временно не смог загрузить трек. Попробуй ещё раз');
+      if (previewTrackId === trackId) recoverSoundCloudAlternative(t, 'SoundCloud refresh failed').then(function (ok) {
+        if (!ok && previewTrackId === trackId) toast('SoundCloud не смог воспроизвести трек, другой источник не найден');
+      });
     });
     return true;
   }
@@ -1155,7 +1196,9 @@
             else startAudio(fresh.url || t.preview, t);
           }).catch(function (retryError) {
             console.error('[EvuMusic] SoundCloud resolve retry failed:', retryError);
-            if (previewTrackId === String(t.id)) toast('SoundCloud временно не смог подготовить трек. Попробуй ещё раз');
+            if (previewTrackId === String(t.id)) recoverSoundCloudAlternative(t, 'SoundCloud resolve failed').then(function (ok) {
+              if (!ok && previewTrackId === String(t.id)) toast('SoundCloud не смог подготовить трек, другой источник не найден');
+            });
           });
         });
       }
