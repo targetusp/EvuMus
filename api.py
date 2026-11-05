@@ -8,6 +8,7 @@ import base64
 import asyncio
 import collections
 import time
+import difflib
 from urllib.parse import parse_qsl, urljoin, urlparse
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -298,6 +299,8 @@ def pack(t: dict) -> dict:
         "duration": t.get("duration", 0), "dur": fmt_duration(t.get("duration", 0)),
         "cover": cover, "stream_url": stream, "preview_url": stream, "preview": stream,
         "full": full, "source": t["source"],
+        "ext_id": str(t.get("ext_id") or ""),
+        "ym_id": str(t.get("ym_id") or ""),
     }
 
 def rank(tracks: list, query: str) -> list:
@@ -630,7 +633,8 @@ async def hls_proxy(token: str, request: Request):
     url = unsign(token)
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
-    allowed = ("sndcdn.com", "soundcloud.com", "scdn.co")
+    # SoundCloud now serves HLS from playback.media-streaming.soundcloud.cloud.
+    allowed = ("sndcdn.com", "soundcloud.com", "scdn.co", "soundcloud.cloud")
     if parsed.scheme != "https" or not any(host == suffix or host.endswith("." + suffix) for suffix in allowed):
         raise HTTPException(status_code=403, detail="HLS host is not allowed")
     return await _serve_hls_manifest(url)
@@ -798,6 +802,74 @@ async def _finish_search(cache_key, pending, merged, seen, term, limit):
                     asyncio.create_task(prewarm_ym(t["ym_id"]))
             except Exception: continue
     except BaseException: pass
+
+# ==========================================
+# ПОЛНЫЙ ТРЕК ПО НАЗВАНИЮ (ДЛЯ ПЕСЕН ИЗ ITUNES-АЛЬБОМОВ)
+# ==========================================
+_track_resolve_cache = {}
+
+def _match_text(value: str) -> str:
+    value = norm(value).lower()
+    value = re.sub(r"\([^)]*(?:remaster|deluxe|bonus|explicit|clean)[^)]*\)", " ", value, flags=re.I)
+    return re.sub(r"[^\w\s]", " ", value, flags=re.U)
+
+@app.get("/api/track/resolve")
+async def resolve_full_track(title: str = Query(...), artist: str = Query(""), duration: int = Query(0, ge=0)):
+    title, artist = norm(title), norm(artist)
+    if not title:
+        raise HTTPException(status_code=400, detail="Track title is required")
+    cache_key = (_match_text(title), _match_text(artist))
+    cached = _cache_get(_track_resolve_cache, cache_key)
+    if cached is not None:
+        return cached
+
+    query = (artist + " " + title).strip()
+    tasks = []
+    if ENABLE_MUZOFOND: tasks.append(asyncio.create_task(muzofond_search(query, 15)))
+    if ENABLE_YANDEX: tasks.append(asyncio.create_task(yandex_search(query, 15)))
+    if ENABLE_SOUNDCLOUD: tasks.append(asyncio.create_task(soundcloud_search(query, 15)))
+    if not tasks:
+        raise HTTPException(status_code=404, detail="No full-track sources enabled")
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    wanted_title = _match_text(title)
+    wanted_artist = _match_text(artist)
+    candidates = []
+    for group in results:
+        if isinstance(group, Exception) or not group:
+            continue
+        for item in group:
+            if item.get("full") is False or item.get("source") in ("itunes", "deezer"):
+                continue
+            if not (item.get("audio_url") or item.get("ym_id") or (item.get("source") == "soundcloud" and item.get("ext_id"))):
+                continue
+            got_title = _match_text(item.get("title", ""))
+            title_score = difflib.SequenceMatcher(None, wanted_title, got_title).ratio()
+            got_artist = _match_text(item.get("artist", ""))
+            artist_score = difflib.SequenceMatcher(None, wanted_artist, got_artist).ratio() if wanted_artist else 1.0
+            got_duration = int(item.get("duration") or 0)
+            duration_ok = not duration or not got_duration or abs(duration - got_duration) <= max(20, int(duration * 0.12))
+            # Reject different songs and obvious remix/cover matches.
+            if title_score < 0.84 or not duration_ok:
+                continue
+            if wanted_artist and artist_score < 0.35 and title_score < 0.96:
+                continue
+            score = title_score * 0.78 + artist_score * 0.17 + (0.05 if duration_ok else 0)
+            candidates.append((score, item))
+
+    if not candidates:
+        raise HTTPException(status_code=404, detail="Full version not found for this album track")
+    candidates.sort(key=lambda pair: pair[0], reverse=True)
+    packed = pack(candidates[0][1])
+    if not packed.get("preview"):
+        raise HTTPException(status_code=404, detail="Full audio stream is unavailable")
+    _cache_put(_track_resolve_cache, cache_key, packed)
+    chosen = candidates[0][1]
+    if chosen.get("source") == "soundcloud":
+        asyncio.create_task(prewarm_sc(chosen.get("ext_id")))
+    elif chosen.get("source") == "yandex":
+        asyncio.create_task(prewarm_ym(chosen.get("ym_id")))
+    return packed
 
 # ==========================================
 # АЛЬБОМЫ (С КЕШЕМ)
