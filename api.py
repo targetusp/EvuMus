@@ -45,6 +45,7 @@ _search_cache = {}
 _album_cache = {}
 _album_search_cache = {}
 _sc_resolve_cache = {}
+_sc_resolve_inflight = {}
 _ym_link_cache = {}
 
 _CACHE_TTL = 900        # 15 минут
@@ -396,7 +397,7 @@ async def soundcloud_search(query: str, limit: int) -> list:
         return out
     except Exception: return []
 
-async def prewarm_sc(sc_id):
+async def _prewarm_sc_impl(sc_id):
     """Resolve SoundCloud to a browser-playable progressive stream when possible."""
     sc_id = str(sc_id)
     if sc_id in _sc_resolve_cache:
@@ -455,6 +456,21 @@ async def prewarm_sc(sc_id):
                 continue
     except Exception as exc:
         print(f"[SOUNDCLOUD RESOLVE ERROR] {sc_id}: {exc}")
+
+async def prewarm_sc(sc_id):
+    """Coalesce simultaneous requests so background warm-up and Play share one resolve."""
+    sc_id = str(sc_id)
+    if sc_id in _sc_resolve_cache:
+        return
+    task = _sc_resolve_inflight.get(sc_id)
+    if task is None:
+        task = asyncio.create_task(_prewarm_sc_impl(sc_id))
+        _sc_resolve_inflight[sc_id] = task
+    try:
+        await task
+    finally:
+        if _sc_resolve_inflight.get(sc_id) is task:
+            _sc_resolve_inflight.pop(sc_id, None)
 
 async def _proxy_audio_url(url: str, request: Request, default_type: str = "audio/mpeg"):
     cli = get_http()
@@ -557,10 +573,16 @@ async def soundcloud_audio(sc_id: str, request: Request):
     raise HTTPException(status_code=415, detail="Unsupported SoundCloud stream format")
 
 @app.get("/api/sc/resolve/{sc_id}")
-async def soundcloud_resolve(sc_id: str):
-    """Resolve SoundCloud before the user presses play; avoids async autoplay loss on phones."""
+async def soundcloud_resolve(sc_id: str, refresh: bool = False):
+    """Resolve SoundCloud before Play; refresh retries a stale/transient HLS URL."""
     if not ENABLE_SOUNDCLOUD:
         raise HTTPException(status_code=503, detail="SoundCloud disabled")
+    if refresh:
+        old_task = _sc_resolve_inflight.get(str(sc_id))
+        if old_task is not None:
+            try: await old_task
+            except Exception: pass
+        _sc_resolve_cache.pop(str(sc_id), None)
     if sc_id not in _sc_resolve_cache:
         await prewarm_sc(sc_id)
     cached = _sc_resolve_cache.get(sc_id)
