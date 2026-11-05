@@ -317,6 +317,8 @@ def rank(tracks: list, query: str) -> list:
         elif q and q in title: s += 4
         if q and junk_re.search(title) and not junk_re.search(q): s -= 12
         if t.get("full", True): s += 1
+        # Prefer catalog-backed matches over SoundCloud uploads when relevance is close.
+        s += {"yandex": 2.0, "muzofond": 1.0, "soundcloud": 0.0}.get(t.get("source"), 0.0)
         if not t.get("duration"): s -= 3
         return -s
     tracks = [t for t in tracks if t.get("title")]
@@ -388,9 +390,13 @@ async def soundcloud_search(query: str, limit: int) -> list:
                 user = t.get("user") or {}
                 artwork = user.get("avatar_url")
                 if artwork: artwork = artwork.replace("-large.jpg", "-t500x500.jpg")
+            user = t.get("user") or {}
+            publisher = t.get("publisher_metadata") or {}
+            # SoundCloud username is often just an uploader handle, not the performer.
+            artist_name = publisher.get("artist") or user.get("full_name") or user.get("username") or "Неизвестен"
             out.append({
                 "ext_id": str(t["id"]), "title": norm(t.get("title") or "Без названия"),
-                "artist": norm((t.get("user") or {}).get("username") or "Неизвестен"),
+                "artist": norm(artist_name),
                 "duration": int((t.get("duration") or 0) / 1000), "cover": artwork or "",
                 "track_authorization": t.get("track_authorization") or "",
                 "source": "soundcloud", "full": True
@@ -775,6 +781,32 @@ async def prewarm_ym(ym_id: str):
         if link: _cache_put(_ym_link_cache, ym_id, link)
     except Exception: pass
 
+# Источники с более точными метаданными имеют приоритет при совпадении
+# названия/исполнителя. SoundCloud username часто не является настоящим артистом
+# и в поиске может вернуть другую запись с тем же заголовком.
+_SOURCE_PRIORITY = {"yandex": 0, "muzofond": 1, "soundcloud": 2}
+
+def _track_key(item: dict):
+    return (_match_text(item.get("title", "")), _match_text(item.get("artist", "")))
+
+def _duration_compatible(a: dict, b: dict) -> bool:
+    da, db = int(a.get("duration") or 0), int(b.get("duration") or 0)
+    if not da or not db:
+        return True
+    return abs(da - db) <= max(12, int(max(da, db) * 0.06))
+
+def _merge_search_track(merged: list, item: dict) -> None:
+    key = _track_key(item)
+    for index, old in enumerate(merged):
+        if _track_key(old) != key or not _duration_compatible(old, item):
+            continue
+        old_priority = _SOURCE_PRIORITY.get(old.get("source"), 9)
+        new_priority = _SOURCE_PRIORITY.get(item.get("source"), 9)
+        if new_priority < old_priority:
+            merged[index] = item
+        return
+    merged.append(item)
+
 # ==========================================
 # ЭНДПОИНТЫ ПОИСКА (С КЕШЕМ)
 # ==========================================
@@ -811,9 +843,7 @@ async def search(q: Optional[str] = Query(None), query: Optional[str] = Query(No
                     if not res: continue
                     for t in res:
                         if not _usable(t): continue
-                        key = (str(t.get("artist") or "").lower(), str(t.get("title") or "").lower())
-                        if key in seen: continue
-                        seen.add(key); merged.append(t)
+                        _merge_search_track(merged, t)
                 except BaseException: continue
 
         # Отдаём результат сразу, как только есть что показать.
@@ -867,9 +897,7 @@ async def _finish_search(cache_key, pending, merged, seen, term, limit):
                 if not res: continue
                 for t in res:
                     if t.get("full") is False or t.get("source") in ("itunes", "deezer"): continue
-                    key = (str(t.get("artist") or "").lower(), str(t.get("title") or "").lower())
-                    if key in seen: continue
-                    seen.add(key); merged.append(t)
+                    _merge_search_track(merged, t)
             except BaseException: continue
         for task in pending: task.cancel()
         full = rank(merged, term)[:limit]
@@ -891,7 +919,7 @@ async def _finish_search(cache_key, pending, merged, seen, term, limit):
 # ==========================================
 # ПОЛНЫЙ ТРЕК ПО НАЗВАНИЮ (ДЛЯ ПЕСЕН ИЗ ITUNES-АЛЬБОМОВ)
 # ==========================================
-_track_resolve_cache = {}
+_track_resolve_cache = {}  # strict-match cache (duration included in key)
 
 def _match_text(value: str) -> str:
     value = norm(value).lower()
@@ -903,7 +931,7 @@ async def resolve_full_track(title: str = Query(...), artist: str = Query(""), d
     title, artist = norm(title), norm(artist)
     if not title:
         raise HTTPException(status_code=400, detail="Track title is required")
-    cache_key = (_match_text(title), _match_text(artist), _match_text(exclude_source))
+    cache_key = (_match_text(title), _match_text(artist), int(duration or 0), _match_text(exclude_source))
     cached = _cache_get(_track_resolve_cache, cache_key)
     if cached is not None:
         return cached
@@ -935,13 +963,17 @@ async def resolve_full_track(title: str = Query(...), artist: str = Query(""), d
             got_artist = _match_text(item.get("artist", ""))
             artist_score = difflib.SequenceMatcher(None, wanted_artist, got_artist).ratio() if wanted_artist else 1.0
             got_duration = int(item.get("duration") or 0)
-            duration_ok = not duration or not got_duration or abs(duration - got_duration) <= max(20, int(duration * 0.12))
-            # Reject different songs and obvious remix/cover matches.
-            if title_score < 0.84 or not duration_ok:
+            # A favorite with a known duration must not be silently mapped to
+            # another recording that merely shares title/artist metadata.
+            duration_delta = abs(duration - got_duration) if duration and got_duration else 0
+            duration_ok = (not duration) or (bool(got_duration) and duration_delta <= max(8, int(duration * 0.04)))
+            if title_score < 0.92 or not duration_ok:
                 continue
-            if wanted_artist and artist_score < 0.35 and title_score < 0.96:
+            if wanted_artist and artist_score < 0.45 and not (title_score >= 0.98 and duration_ok):
                 continue
-            score = title_score * 0.78 + artist_score * 0.17 + (0.05 if duration_ok else 0)
+            duration_score = 1.0 if not duration else max(0.0, 1.0 - (duration_delta / max(duration, 1)))
+            source_bonus = {"yandex": 0.035, "muzofond": 0.02, "soundcloud": 0.0}.get(item.get("source"), 0.0)
+            score = title_score * 0.48 + artist_score * 0.22 + duration_score * 0.28 + source_bonus
             candidates.append((score, item))
 
     if not candidates:
