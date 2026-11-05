@@ -766,15 +766,18 @@
   var isMobileAudio = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) || (window.Telegram && window.Telegram.WebApp);
   window.__evuAudio = function () { return previewAudio; };
 
-  function resolveSoundCloud(id) {
+  function resolveSoundCloud(id, forceRefresh) {
     id = String(id);
+    if (forceRefresh) { delete scResolveCache[id]; delete scResolvePromises[id]; }
     if (scResolveCache[id]) return Promise.resolve(scResolveCache[id]);
     if (scResolvePromises[id]) return scResolvePromises[id];
-    scResolvePromises[id] = fetch(API_URL + '/api/sc/resolve/' + encodeURIComponent(id))
+    var endpoint = API_URL + '/api/sc/resolve/' + encodeURIComponent(id) + (forceRefresh ? '?refresh=true' : '');
+    var requestPromise = fetch(endpoint, { cache: 'no-store' })
       .then(function (r) { if (!r.ok) throw new Error('SoundCloud resolve HTTP ' + r.status); return r.json(); })
-      .then(function (data) { scResolveCache[id] = data; delete scResolvePromises[id]; return data; })
-      .catch(function (error) { delete scResolvePromises[id]; throw error; });
-    return scResolvePromises[id];
+      .then(function (data) { scResolveCache[id] = data; if (scResolvePromises[id] === requestPromise) delete scResolvePromises[id]; return data; })
+      .catch(function (error) { if (scResolvePromises[id] === requestPromise) delete scResolvePromises[id]; throw error; });
+    scResolvePromises[id] = requestPromise;
+    return requestPromise;
   }
 
   function loadHlsLibrary() {
@@ -914,7 +917,8 @@
     }
   }
 
-  function startHlsAudio(url, t) {
+  function startHlsAudio(url, t, retryCount) {
+    retryCount = retryCount || 0;
     if (!url) { toast('Ссылка на HLS-поток не найдена'); return; }
     if (activeHls) { try { activeHls.destroy(); } catch (e) {} activeHls = null; }
     if (previewAudio) {
@@ -1003,6 +1007,25 @@
         setPlayingUI(false);
         try { hls.destroy(); } catch (e) {}
         if (activeHls === hls) activeHls = null;
+        // SoundCloud occasionally returns a transient/stale HLS manifest on the
+        // first request. Refresh it once and rebuild the player instead of
+        // forcing the user to select another track and come back.
+        if (retryCount < 1 && t.source === 'soundcloud') {
+          var retryId = String(t.ext_id || String(t.id).replace(/^soundcloud_/, ''));
+          console.warn('[EvuMusic] retrying SoundCloud HLS with a fresh manifest:', retryId);
+          setTimeout(function () {
+            if (previewTrackId !== String(t.id)) return;
+            resolveSoundCloud(retryId, true).then(function (fresh) {
+              if (previewTrackId !== String(t.id)) return;
+              if (fresh && fresh.url) startHlsAudio(fresh.url, t, retryCount + 1);
+              else throw new Error('Fresh HLS URL is empty');
+            }).catch(function (retryError) {
+              console.error('[EvuMusic] HLS refresh retry failed:', retryError);
+              if (previewTrackId === String(t.id)) toast('Не удалось загрузить HLS-поток. Нажми Play ещё раз');
+            });
+          }, 500);
+          return;
+        }
         var detail = data.details || data.type || 'unknown';
         toast(data.type === Hls.ErrorTypes.NETWORK_ERROR
           ? 'Не удалось загрузить сегменты HLS (ошибка сети)'
