@@ -932,52 +932,45 @@
     showPlayer(t);
     setPlayingUI(false);
 
-    audio.onplaying = function () {
-      if (previewAudio === audio) setPlayingUI(true);
-    };
-    audio.onwaiting = function () {
-      if (previewAudio === audio) setPlayingUI(false);
-    };
+    audio.onplaying = function () { if (previewAudio === audio) setPlayingUI(true); };
+    audio.onwaiting = function () { if (previewAudio === audio) setPlayingUI(false); };
     audio.onerror = function () {
       if (previewAudio !== audio) return;
       setPlayingUI(false);
       var err = audio.error;
-      console.error('[EvuMusic] native HLS media error:', err && { code: err.code, message: err.message });
-      toast(err && err.code === 4
-        ? 'Браузер не поддерживает этот HLS-поток'
-        : 'Не удалось загрузить HLS-аудио. Проверь соединение');
+      console.error('[EvuMusic] HLS media element error:', err && { code: err.code, message: err.message, src: audio.currentSrc });
+      toast(err && err.code === 4 ? 'Браузер не поддерживает кодек этого HLS-потока' : 'Не удалось загрузить HLS-поток');
     };
 
     var absoluteUrl = new URL(url, window.location.href).href;
-
-    // Safari / iOS WebView: используем встроенный HLS, не подключая MSE.
     var nativeHls = '';
     try { nativeHls = audio.canPlayType('application/vnd.apple.mpegurl') || audio.canPlayType('application/x-mpegURL'); } catch (e) {}
+
+    // Safari/iOS: native HLS is more reliable than MediaSource in WKWebView.
     if (nativeHls) {
       audio.src = absoluteUrl;
-      // play() вызывается прямо в обработчике пользовательского нажатия.
+      try { audio.load(); } catch (e) {}
       var nativePromise;
       try { nativePromise = audio.play(); }
-      catch (e) { console.error('[EvuMusic] native HLS play error:', e); toast('Нажми Play ещё раз для запуска'); return; }
+      catch (e) { console.error('[EvuMusic] native HLS play:', e); toast('Нажми Play ещё раз для запуска'); return; }
       if (nativePromise && nativePromise.catch) nativePromise.catch(function (e) {
         if (previewAudio !== audio) return;
         console.error('[EvuMusic] native HLS play rejected:', e);
-        toast(e && e.name === 'NotAllowedError' ? 'Разреши воспроизведение нажатием Play' : 'Не удалось запустить HLS-аудио');
+        toast(e && e.name === 'NotAllowedError' ? 'Браузер ждёт нажатия Play' : 'Не удалось начать HLS-воспроизведение');
       });
       return;
     }
 
-    // Для Chrome/Android/desktop: hls.js + MediaSource.
-    // Библиотека загружается заранее при открытии приложения. Если пользователь
-    // нажал Play раньше её загрузки, повторяем запуск после загрузки и просим
-    // только один повторный клик, вместо скрытой ошибки autoplay.
     function attachHls(Hls) {
       if (previewAudio !== audio) return;
       if (!Hls || !Hls.isSupported()) {
-        console.error('[EvuMusic] MSE/HLS is not supported in this browser');
-        toast('Этот браузер не поддерживает HLS. Попробуй другой источник');
+        console.error('[EvuMusic] HLS.js/MSE unsupported', { mse: !!window.MediaSource, ua: navigator.userAgent });
+        toast('В этом браузере нет поддержки HLS/MSE. Попробуй другой источник');
         return;
       }
+
+      var recoveredMedia = false;
+      var recoveredNetwork = false;
       var hls = new Hls({
         enableWorker: false,
         lowLatencyMode: false,
@@ -985,61 +978,73 @@
         maxBufferLength: 20,
         maxMaxBufferLength: 40,
         startFragPrefetch: true,
+        manifestLoadingTimeOut: 20000,
+        manifestLoadingMaxRetry: 4,
+        levelLoadingTimeOut: 20000,
+        levelLoadingMaxRetry: 4,
+        fragLoadingTimeOut: 30000,
+        fragLoadingMaxRetry: 5,
         xhrSetup: function (xhr) { xhr.withCredentials = false; }
       });
       activeHls = hls;
+
       hls.on(Hls.Events.ERROR, function (_event, data) {
         console.error('[EvuMusic] HLS error:', data);
         if (!data || !data.fatal || previewAudio !== audio) return;
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && !recoveredNetwork) {
+          recoveredNetwork = true;
+          try { hls.startLoad(); return; } catch (e) { console.error('[EvuMusic] HLS network recovery failed:', e); }
+        }
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !recoveredMedia) {
+          recoveredMedia = true;
+          try { hls.recoverMediaError(); return; } catch (e) { console.error('[EvuMusic] HLS media recovery failed:', e); }
+        }
         setPlayingUI(false);
-        var detail = data.details || data.type || 'unknown';
         try { hls.destroy(); } catch (e) {}
         if (activeHls === hls) activeHls = null;
+        var detail = data.details || data.type || 'unknown';
         toast(data.type === Hls.ErrorTypes.NETWORK_ERROR
-          ? 'Ошибка сети при загрузке HLS-аудио'
-          : 'HLS не смог декодировать поток (' + detail + ')');
+          ? 'Не удалось загрузить сегменты HLS (ошибка сети)'
+          : 'HLS: ошибка декодирования потока (' + detail + ')');
       });
 
-      // attachMedia синхронно назначает MediaSource audio.src. Вызываем play()
-      // в том же пользовательском событии, не дожидаясь MANIFEST_PARSED.
-      hls.attachMedia(audio);
-      hls.loadSource(absoluteUrl);
-      var playPromise;
-      try { playPromise = audio.play(); }
-      catch (e) {
-        console.warn('[EvuMusic] immediate HLS play deferred:', e);
-      }
-      if (playPromise && playPromise.catch) playPromise.catch(function (e) {
+      hls.on(Hls.Events.MEDIA_ATTACHED, function () {
         if (previewAudio !== audio) return;
-        // До появления первого сегмента браузер иногда отклоняет ранний play.
-        // Повторяем автоматически после готовности манифеста ниже.
-        console.warn('[EvuMusic] early HLS play pending/rejected:', e);
+        hls.loadSource(absoluteUrl);
       });
       hls.on(Hls.Events.MANIFEST_PARSED, function () {
-        if (previewAudio !== audio || !audio.paused) return;
-        var p;
-        try { p = audio.play(); }
-        catch (e) { console.error('[EvuMusic] HLS play after manifest:', e); return; }
-        if (p && p.catch) p.catch(function (e) {
-          if (previewAudio === audio) {
-            console.error('[EvuMusic] HLS play rejected after manifest:', e);
-            toast(e && e.name === 'NotAllowedError' ? 'Нажми Play для разрешения воспроизведения' : 'Не удалось начать HLS-воспроизведение');
-          }
-        });
+        if (previewAudio !== audio) return;
+        // First play attempt is made in the original click handler below. If the
+        // browser deferred it until MediaSource opened, retry once when ready.
+        if (audio.paused) {
+          var p;
+          try { p = audio.play(); } catch (e) { console.warn('[EvuMusic] HLS delayed play:', e); return; }
+          if (p && p.catch) p.catch(function (e) {
+            if (previewAudio === audio) {
+              console.warn('[EvuMusic] HLS delayed play blocked:', e);
+              if (e && e.name === 'NotAllowedError') toast('Нажми Play ещё раз, чтобы разрешить запуск');
+            }
+          });
+        }
+      });
+
+      hls.attachMedia(audio);
+      // The MediaSource is attached synchronously. Starting play here preserves
+      // the user gesture on desktop browsers; MANIFEST_PARSED retries if needed.
+      var playPromise;
+      try { playPromise = audio.play(); }
+      catch (e) { console.warn('[EvuMusic] initial HLS play deferred:', e); }
+      if (playPromise && playPromise.catch) playPromise.catch(function (e) {
+        if (previewAudio === audio) console.warn('[EvuMusic] initial HLS play rejected:', e);
       });
     }
 
     if (window.Hls) {
       attachHls(window.Hls);
     } else {
-      // Не запускаем async-play незаметно: на этот момент user activation уже
-      // может истечь. Загрузка библиотеки обычно завершится ещё до клика.
-      loadHlsLibrary().then(function (Hls) {
-        if (previewAudio !== audio) return;
-        attachHls(Hls);
-      }).catch(function (e) {
+      loadHlsLibrary().then(attachHls).catch(function (e) {
         console.error('[EvuMusic] HLS library unavailable:', e);
-        if (previewAudio === audio) toast('Не удалось загрузить HLS-модуль. Обнови страницу и попробуй снова');
+        if (previewAudio === audio) toast('Не удалось загрузить HLS-модуль. Обнови страницу');
       });
     }
   }
@@ -1077,8 +1082,17 @@
         if (resolved.type === 'hls') startHlsAudio(resolved.url, t);
         else startAudio(resolved.url || t.preview, t);
       } else {
-        toast('Подготавливаю аудио. Нажми Play ещё раз через секунду');
-        resolveSoundCloud(scId).catch(function (e) { console.error('[EvuMusic] SoundCloud resolve failed:', e); toast('SoundCloud не смог подготовить аудио'); });
+        previewTrackId = String(t.id);
+        showPlayer(t);
+        setPlayingUI(false);
+        toast('Подготавливаю аудио…');
+        resolveSoundCloud(scId).then(function (resolved) {
+          if (previewTrackId && previewTrackId !== String(t.id)) return;
+          // Continue automatically when possible; if autoplay policy blocks it,
+          // the player remains selected and the user can tap Play once more.
+          if (resolved.type === 'hls') startHlsAudio(resolved.url, t);
+          else startAudio(resolved.url || t.preview, t);
+        }).catch(function (e) { console.error('[EvuMusic] SoundCloud resolve failed:', e); toast('SoundCloud не смог подготовить аудио'); });
       }
       return;
     }
