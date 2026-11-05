@@ -389,9 +389,10 @@ async def soundcloud_search(query: str, limit: int) -> list:
                 artwork = user.get("avatar_url")
                 if artwork: artwork = artwork.replace("-large.jpg", "-t500x500.jpg")
             out.append({
-                "ext_id": str(t["id"]), "title": norm(t.get("title") or "Без названия"), 
-                "artist": norm((t.get("user") or {}).get("username") or "Неизвестен"), 
-                "duration": int((t.get("duration") or 0) / 1000), "cover": artwork or "", 
+                "ext_id": str(t["id"]), "title": norm(t.get("title") or "Без названия"),
+                "artist": norm((t.get("user") or {}).get("username") or "Неизвестен"),
+                "duration": int((t.get("duration") or 0) / 1000), "cover": artwork or "",
+                "track_authorization": t.get("track_authorization") or "",
                 "source": "soundcloud", "full": True
             })
         return out
@@ -406,9 +407,19 @@ async def _prewarm_sc_impl(sc_id):
         cli = get_http()
         r = await cli.get(SC_API + "/tracks/" + sc_id, params=sc_params())
         if r.status_code != 200:
+            print(f"[SOUNDCLOUD RESOLVE] {sc_id}: track endpoint HTTP {r.status_code}: {r.text[:300]}")
             return
         track = r.json()
         trans = (track.get("media") or {}).get("transcodings") or []
+        # SoundCloud requires track_authorization for some private, age-gated,
+        # and newer stream endpoints. The token is returned with track metadata.
+        authorization = str(track.get("track_authorization") or "").strip()
+        resolve_params = sc_params()
+        if authorization:
+            resolve_params["track_authorization"] = authorization
+        if not trans:
+            print(f"[SOUNDCLOUD RESOLVE] {sc_id}: track metadata has no transcodings; status={r.status_code}")
+            return
 
         # Prefer formats supported by mobile Safari and Android WebView.
         # MP3 is the safest common denominator; AAC/MP4 is the next choice.
@@ -426,7 +437,7 @@ async def _prewarm_sc_impl(sc_id):
             if "audio/ogg" in mime or "opus" in mime:
                 continue
             try:
-                resolved = await cli.get(item["url"], params=sc_params())
+                resolved = await cli.get(item["url"], params=resolve_params)
                 if resolved.status_code == 200:
                     direct_url = (resolved.json() or {}).get("url")
                     if direct_url:
@@ -441,7 +452,7 @@ async def _prewarm_sc_impl(sc_id):
         hls = [x for x in trans if x.get("format", {}).get("protocol") == "hls"]
         for item in hls:
             try:
-                resolved = await cli.get(item["url"], params=sc_params())
+                resolved = await cli.get(item["url"], params=resolve_params)
                 if resolved.status_code != 200:
                     continue
                 loc = (resolved.json() or {}).get("url")
@@ -452,8 +463,10 @@ async def _prewarm_sc_impl(sc_id):
                 if manifest.text.lstrip().startswith("#EXTM3U"):
                     _sc_resolve_cache[sc_id] = {"type": "hls", "url": str(manifest.url)}
                     return
-            except (httpx.HTTPError, ValueError, KeyError):
+            except (httpx.HTTPError, ValueError, KeyError) as exc:
+                print(f"[SOUNDCLOUD RESOLVE] {sc_id}: HLS transcoding failed: {type(exc).__name__}: {exc}")
                 continue
+        print(f"[SOUNDCLOUD RESOLVE] {sc_id}: no usable progressive or HLS transcoding (count={len(trans)})")
     except Exception as exc:
         print(f"[SOUNDCLOUD RESOLVE ERROR] {sc_id}: {exc}")
 
