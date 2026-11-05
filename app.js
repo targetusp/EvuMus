@@ -264,7 +264,7 @@
     alternativeResolvePromises[key] = (async function () {
       try {
         console.warn('[EvuMusic] resolving SoundCloud favorite from another source:', key, reason || '');
-        var duration = Number(tr.duration) || parseDuration(tr.dur || tr.duration) || 0;
+        var duration = parseDuration(tr.dur || tr.duration) || (Number(tr.duration) || 0);
         var params = new URLSearchParams({ title: tr.title || '', artist: tr.artist || '', duration: String(duration), exclude_source: 'soundcloud' });
         var response = await fetch(API_URL + '/api/track/resolve?' + params.toString(), { cache: 'no-store' });
         if (!response.ok) throw new Error('Alternative source HTTP ' + response.status);
@@ -1096,6 +1096,10 @@
               if (previewTrackId === String(t.id)) toast('Не удалось загрузить HLS-поток. Нажми Play ещё раз');
             });
           }, 500);
+          return;
+        }
+        if (t.source === 'soundcloud') {
+          retrySoundCloudPlayback(t, retryCount + 1, 'fatal HLS error: ' + (data.details || data.type || 'unknown'));
           return;
         }
         var detail = data.details || data.type || 'unknown';
