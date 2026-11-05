@@ -8,7 +8,7 @@ import base64
 import asyncio
 import collections
 import time
-from urllib.parse import parse_qsl, urljoin
+from urllib.parse import parse_qsl, urljoin, urlparse
 from typing import Optional
 from contextlib import asynccontextmanager
 
@@ -394,69 +394,106 @@ async def soundcloud_search(query: str, limit: int) -> list:
     except Exception: return []
 
 async def prewarm_sc(sc_id):
-    if sc_id in _sc_resolve_cache: return
+    """Resolve SoundCloud to a browser-playable progressive stream when possible."""
+    sc_id = str(sc_id)
+    if sc_id in _sc_resolve_cache:
+        return
     try:
         cli = get_http()
         r = await cli.get(SC_API + "/tracks/" + sc_id, params=sc_params())
-        if r.status_code != 200: return
-        t = r.json()
-        trans = (t.get("media") or {}).get("transcodings") or []
-        
-        prog = [x for x in trans if x.get("format", {}).get("protocol") == "progressive"]
-        if prog:
-            rl = await cli.get(prog[0]["url"], params=sc_params())
-            if rl.status_code == 200:
-                _sc_resolve_cache[sc_id] = {"type": "direct", "url": rl.json().get("url")}
-                return
+        if r.status_code != 200:
+            return
+        track = r.json()
+        trans = (track.get("media") or {}).get("transcodings") or []
 
-        frag = [x for x in trans if "aac_160k" in (x.get("preset") or "")] or [x for x in trans if x.get("format", {}).get("protocol") == "hls"]
-        if not frag: return
-        loc = None
-        for x in frag:
-            rl = await cli.get(x["url"], params=sc_params())
-            if rl.status_code == 200:
-                loc = (rl.json() or {}).get("url")
-                if loc: break
-        if not loc: return
-        
-        pl = await cli.get(loc)
-        text = pl.text
-        init_m = re.search(r'#EXT-X-MAP:URI="([^"]+)"', text)
-        segs = [ln.strip() for ln in text.splitlines() if ln and not ln.startswith("#")]
-        
-        _sc_resolve_cache[sc_id] = {
-            "type": "hls",
-            "loc": loc,
-            "init": init_m.group(1) if init_m else None,
-            "segs": segs
-        }
-    except Exception: pass
+        # Progressive streams are directly playable by the HTML audio element.
+        progressive = [x for x in trans if x.get("format", {}).get("protocol") == "progressive"]
+        for item in progressive:
+            try:
+                resolved = await cli.get(item["url"], params=sc_params())
+                if resolved.status_code == 200:
+                    direct_url = (resolved.json() or {}).get("url")
+                    if direct_url:
+                        _sc_resolve_cache[sc_id] = {"type": "direct", "url": direct_url}
+                        return
+            except (KeyError, httpx.HTTPError, ValueError):
+                continue
+
+        # Some SoundCloud tracks only expose HLS. We only pass fragmented MP4
+        # through when the manifest has an initialization segment; MPEG-TS HLS
+        # cannot be concatenated and played as a normal <audio src> in Chromium.
+        hls = [x for x in trans if x.get("format", {}).get("protocol") == "hls"]
+        for item in hls:
+            try:
+                resolved = await cli.get(item["url"], params=sc_params())
+                if resolved.status_code != 200:
+                    continue
+                loc = (resolved.json() or {}).get("url")
+                if not loc:
+                    continue
+                manifest = await cli.get(loc)
+                manifest.raise_for_status()
+                manifest_text = manifest.text
+                init_match = re.search(r'#EXT-X-MAP:URI="([^"]+)"', manifest_text)
+                segments = [line.strip() for line in manifest_text.splitlines()
+                            if line.strip() and not line.lstrip().startswith("#")]
+                if init_match and segments:
+                    _sc_resolve_cache[sc_id] = {
+                        "type": "hls_fmp4", "loc": str(manifest.url),
+                        "init": init_match.group(1), "segs": segments,
+                    }
+                    return
+            except (httpx.HTTPError, ValueError, KeyError):
+                continue
+    except Exception as exc:
+        print(f"[SOUNDCLOUD RESOLVE ERROR] {sc_id}: {exc}")
 
 async def _proxy_audio_url(url: str, request: Request, default_type: str = "audio/mpeg"):
     cli = get_http()
-    headers = {}
-    if request.headers.get("range"):
-        headers["Range"] = request.headers["range"]
     if request.method == "OPTIONS":
         return Response(status_code=204, headers={
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
             "Access-Control-Allow-Headers": "Range, Content-Type",
         })
+
+    headers = {"Accept": "audio/*,*/*;q=0.8"}
+    range_header = request.headers.get("range")
+    if range_header:
+        headers["Range"] = range_header
     method = "HEAD" if request.method == "HEAD" else "GET"
     try:
-        req = cli.build_request(method, url, headers=headers)
-        upstream = await cli.send(req, stream=(method != "HEAD"))
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"Audio upstream error: {e}")
+        upstream = await cli.send(cli.build_request(method, url, headers=headers), stream=(method != "HEAD"))
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Audio upstream error: {exc}")
+
     if upstream.status_code >= 400:
         status = upstream.status_code
         await upstream.aclose()
         raise HTTPException(status_code=502, detail=f"Audio provider returned HTTP {status}")
+
+    content_type = (upstream.headers.get("content-type") or "").split(";")[0].strip().lower()
+    path = urlparse(url).path.lower()
+    if not content_type or content_type in ("application/octet-stream", "binary/octet-stream"):
+        if path.endswith((".m4a", ".mp4")):
+            content_type = "audio/mp4"
+        elif path.endswith(".aac"):
+            content_type = "audio/aac"
+        elif path.endswith(".ogg") or path.endswith(".opus"):
+            content_type = "audio/ogg"
+        elif path.endswith(".wav"):
+            content_type = "audio/wav"
+        else:
+            content_type = default_type
+    if content_type in ("text/html", "text/plain", "application/json"):
+        await upstream.aclose()
+        raise HTTPException(status_code=502, detail="Audio provider returned a non-audio response")
+
     out_headers = {
-        "Content-Type": upstream.headers.get("content-type", default_type),
+        "Content-Type": content_type,
         "Accept-Ranges": upstream.headers.get("accept-ranges", "bytes"),
         "Access-Control-Allow-Origin": "*",
+        "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
         "Cache-Control": "no-store",
     }
     for name in ("Content-Length", "Content-Range", "Last-Modified", "ETag"):
@@ -467,6 +504,7 @@ async def _proxy_audio_url(url: str, request: Request, default_type: str = "audi
     if method == "HEAD":
         await upstream.aclose()
         return Response(status_code=status_code, headers=out_headers)
+
     async def body():
         try:
             async for chunk in upstream.aiter_raw(64 * 1024):
@@ -481,38 +519,44 @@ async def _proxy_audio_url(url: str, request: Request, default_type: str = "audi
 async def soundcloud_audio(sc_id: str, request: Request):
     if not ENABLE_SOUNDCLOUD:
         raise HTTPException(status_code=503, detail="SoundCloud disabled")
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "Range, Content-Type",
+        })
     if sc_id not in _sc_resolve_cache:
         await prewarm_sc(sc_id)
     cached = _sc_resolve_cache.get(sc_id)
     if not cached:
-        raise HTTPException(status_code=404, detail="SoundCloud stream could not be resolved")
+        raise HTTPException(status_code=415, detail="SoundCloud did not provide a browser-compatible audio stream")
     if cached["type"] == "direct":
         return await _proxy_audio_url(cached["url"], request, "audio/mpeg")
-    if cached["type"] == "hls":
+    if cached["type"] == "hls_fmp4":
         if request.method == "HEAD":
             return Response(status_code=200, headers={
-                "Content-Type": "audio/mp4", "Accept-Ranges": "none",
-                "Access-Control-Allow-Origin": "*",
+                "Content-Type": 'audio/mp4; codecs="mp4a.40.2"',
+                "Accept-Ranges": "none", "Access-Control-Allow-Origin": "*",
             })
         cli = get_http()
         async def gen_hls():
             try:
-                if cached.get("init"):
-                    init_resp = await cli.get(urljoin(cached["loc"], cached["init"]))
-                    init_resp.raise_for_status()
-                    yield init_resp.content
+                init_resp = await cli.get(urljoin(cached["loc"], cached["init"]))
+                init_resp.raise_for_status()
+                yield init_resp.content
                 for segment in cached.get("segs", []):
                     segment_resp = await cli.get(urljoin(cached["loc"], segment))
                     segment_resp.raise_for_status()
                     yield segment_resp.content
-            except httpx.HTTPError as e:
-                print(f"[SOUNDCLOUD HLS STREAM ERROR] {e}")
+            except httpx.HTTPError as exc:
+                print(f"[SOUNDCLOUD HLS STREAM ERROR] {exc}")
                 raise
         return StreamingResponse(gen_hls(), status_code=200, headers={
-            "Content-Type": "audio/mp4", "Accept-Ranges": "none",
-            "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store",
+            "Content-Type": 'audio/mp4; codecs="mp4a.40.2"',
+            "Accept-Ranges": "none", "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "no-store",
         })
-    raise HTTPException(status_code=500, detail="Unsupported SoundCloud stream type")
+    raise HTTPException(status_code=415, detail="Unsupported SoundCloud stream format")
 
 _ym_client = None
 def get_ym():
