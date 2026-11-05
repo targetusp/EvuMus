@@ -45,7 +45,9 @@
 
   var trackRegistry = {};
   var searchTimer = null;
-  var searchRequestId = 0;   
+  var searchRequestId = 0;
+  var searchController = null;
+  var revalidateController = null;
 
   var $ = function (s) { return document.querySelector(s); };
   var $$ = function (s) { return Array.prototype.slice.call(document.querySelectorAll(s)); };
@@ -212,29 +214,39 @@
     }).filter(function (t) { return !!t.preview && t.full !== false; });
   }
 
-  function fetchTracks(query) {
+  function fetchTracks(query, signal) {
     if (searchCache[query] && searchCache[query].length) return Promise.resolve(searchCache[query]);
     var url = API_URL + '/api/search?q=' + encodeURIComponent(query);
-    return fetch(url).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }).then(function (d) {
+    return fetch(url, { signal: signal }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then(function (d) {
       var tracks = mapTracks(d);
-      if (tracks.length) searchCache[query] = tracks;   // пустое не кешируем
+      if (tracks.length) searchCache[query] = tracks;
       return tracks;
     });
   }
 
-  // Фоновое обновление кеша (не блокирует отрисовку)
+  // Обновляем кеш только для последнего актуального запроса.
   function revalidateTracks(query) {
+    if (revalidateController) revalidateController.abort();
+    revalidateController = new AbortController();
+    var controller = revalidateController;
     var url = API_URL + '/api/search?q=' + encodeURIComponent(query);
-    fetch(url).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }).then(function (d) {
+    fetch(url, { signal: controller.signal }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then(function (d) {
+      if (controller !== revalidateController || inputValue() !== query) return;
       var tracks = mapTracks(d);
       if (!tracks.length) return;
       var prev = searchCache[query];
       searchCache[query] = tracks;
-      // перерисовываем, если результат изменился (в т.ч. «пусто → есть»)
-      // и это всё ещё активный запрос
       var changed = !prev || JSON.stringify(prev) !== JSON.stringify(tracks);
       if (changed && inputValue() === query) renderSearch();
-    }).catch(function () {});
+    }).catch(function (e) {
+      if (e && e.name !== 'AbortError') console.warn('[EvuMusic] search refresh:', e);
+    });
   }
 
   function inputValue() { var i = $('#searchInput'); return i ? (i.value || '').trim() : ''; }
@@ -400,9 +412,10 @@
     hydrateTrackCovers(container); 
     updateRowPlayState(); 
     // Прогреваем кеш начала файла для первых треков — play стартует сразу
-    tracks.slice(0, 10).forEach(function(t) { if (t.preview) warmUrl(t.preview); });
-    // Полная предзагрузка только ближайших, чтобы не тратить трафик
-    tracks.slice(0, 3).forEach(function(t) { if (t.preview) preloadAudio(t.preview); });
+    // Прогреваем только первые два URL диапазонным запросом. Полная
+    // предзагрузка Audio-элементов на каждом поиске создавала лишний трафик
+    // и конкурировала с фактическим воспроизведением.
+    tracks.slice(0, 2).forEach(function(t) { if (t.preview) warmUrl(t.preview); });
     // Наведение на трек = прогрев его ссылки, клик играет без задержки
     container.querySelectorAll('.track').forEach(function(row) {
       var t = trackRegistry[row.getAttribute('data-id')];
@@ -427,55 +440,71 @@
   function renderCollection() { var tracks = library; var el = $('#collEmpty'); if(el) el.hidden = tracks.length > 0; var c = $('#collCount'); if(c) c.textContent = 'Треков: ' + tracks.length; renderList($('#collList'), tracks); }
 
   function renderSearch() {
-    var input = $('#searchInput'); if (!input) return; var q = (input.value || '').trim();
+    var input = $('#searchInput'); if (!input) return;
+    var q = (input.value || '').trim();
     if (searchTab === 'albums') { renderAlbumSearch(q); renderCollection(); return; }
-    
-    var empty = $('#searchEmpty'); if(empty) empty.hidden = true; 
-    var res = $('#searchResults'); if(!res) { renderCollection(); return; }
-    
-    if (!q) { res.innerHTML = ''; if(empty) { empty.hidden = false; empty.innerHTML = '<p>Начни вводить название</p>'; } renderCollection(); return; }
-    
+
+    var empty = $('#searchEmpty');
+    var res = $('#searchResults');
+    if (!res) { renderCollection(); return; }
+
+    if (searchController) searchController.abort();
+    if (revalidateController) revalidateController.abort();
     var reqId = ++searchRequestId;
-    var cached = searchCache[q];
+
+    if (q.length < 2) {
+      res.innerHTML = '';
+      if (empty) { empty.hidden = false; empty.innerHTML = '<p>Начни вводить название</p>'; }
+      renderCollection();
+      return;
+    }
 
     function paint(tracks) {
       if (reqId !== searchRequestId) return;
       tracks.forEach(registerTrack);
       if (!tracks || !tracks.length) {
-        if(empty) { empty.hidden = false; empty.innerHTML = '<p>Ничего не найдено по «' + esc(q) + '»</p>'; }
-        res.innerHTML = ''; return;
+        if (empty) { empty.hidden = false; empty.innerHTML = '<p>Ничего не найдено по «' + esc(q) + '»</p>'; }
+        res.innerHTML = '';
+        return;
       }
-      if(empty) empty.hidden = true;
+      if (empty) empty.hidden = true;
       renderList(res, tracks);
     }
 
-    if (cached) {
-      // Мгновенно из кеша, затем тихое обновление в фоне
+    var cached = searchCache[q];
+    if (cached && cached.length) {
       paint(cached);
       revalidateTracks(q);
     } else {
-      res.innerHTML = '<div class="search-hint">Ищу треки…</div>';
-      fetchTracks(q).then(paint).catch(function () {
-        if (reqId !== searchRequestId) return;
-        if(empty) { empty.hidden = false; empty.innerHTML = '<p>Ошибка поиска</p>'; }
-        res.innerHTML = '';
+      // Не очищаем старые результаты во время запроса — интерфейс не прыгает.
+      if (!res.children.length) res.innerHTML = '<div class="search-hint">Ищу треки…</div>';
+      searchController = new AbortController();
+      var controller = searchController;
+      fetchTracks(q, controller.signal).then(paint).catch(function (error) {
+        if (reqId !== searchRequestId || (error && error.name === 'AbortError')) return;
+        if (empty) { empty.hidden = false; empty.innerHTML = '<p>Не удалось выполнить поиск</p>'; }
+        if (!res.children.length || res.querySelector('.search-hint')) res.innerHTML = '';
+        console.error('[EvuMusic] search failed:', error);
       }).then(function () {
-        // Источники бывают медленными: если вышло пусто — перепроверим
-        // через паузу, когда сервер дособерёт оставшиеся источники.
         if (reqId !== searchRequestId) return;
         if (!searchCache[q] || !searchCache[q].length) {
           setTimeout(function () {
             if (reqId !== searchRequestId || inputValue() !== q) return;
             revalidateTracks(q);
-          }, 2500);
+          }, 1800);
         }
       });
     }
     renderCollection();
   }
 
-  $('#searchInput').addEventListener('input', function () { clearTimeout(searchTimer); searchTimer = setTimeout(renderSearch, 250); });
-  $('#searchInput').addEventListener('keydown', function (e) { if (e.key === 'Enter') { clearTimeout(searchTimer); renderSearch(); } });
+  $('#searchInput').addEventListener('input', function () {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(renderSearch, 420);
+  });
+  $('#searchInput').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { clearTimeout(searchTimer); renderSearch(); }
+  });
 
   // ===== Альбомы =====
   var albumSearchRequestId = 0;
@@ -822,7 +851,7 @@
         if (resumePromise && resumePromise.catch) {
           resumePromise.catch(function (error) {
             console.error('[EvuMusic] resume failed:', error);
-            toast('Не удалось продолжить воспроизведение');
+            toast(error && error.name === 'NotSupportedError' ? 'Источник отдал неподдерживаемый аудиоформат' : 'Не удалось продолжить воспроизведение');
           });
         }
       } else {
@@ -901,7 +930,7 @@
   window.addEventListener('touchmove', function (e) { if (seekDrag && e.touches[0]) seekByPoint(e.touches[0].clientX); });
   window.addEventListener('touchend', function () { if (seekDrag) { seekDrag = false; var pr = $('#playerProgress'); if(pr) pr.classList.remove('dragging'); } });
 
-  var pToggle = $('#playerToggle'); if (pToggle) pToggle.addEventListener('click', function () { if (previewAudio) { if (previewAudio.paused) { previewAudio.play(); setPlayingUI(true); } else { previewAudio.pause(); setPlayingUI(false); } return; } setPlayingUI(!playerState.playing); });
+  var pToggle = $('#playerToggle'); if (pToggle) pToggle.addEventListener('click', function () { if (previewAudio) { if (previewAudio.paused) { var p = previewAudio.play(); if (p && p.catch) p.catch(function (error) { setPlayingUI(false); console.error('[EvuMusic] toggle play failed:', error); toast(error && error.name === 'NotSupportedError' ? 'Источник отдал неподдерживаемый аудиоформат' : 'Не удалось продолжить воспроизведение'); }); } else { previewAudio.pause(); setPlayingUI(false); } return; } setPlayingUI(false); });
 
   var volume = 100; var lastVolume = 100;
   try { var savedVol = parseInt(localStorage.getItem('evu_volume') || '100', 10); if (savedVol >= 0 && savedVol <= 100) volume = savedVol; if (volume > 0) lastVolume = volume; } catch (e) {}
