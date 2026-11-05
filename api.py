@@ -199,9 +199,9 @@ async def toggle_favorite(track: TrackData, user_id: int = Depends(get_user_id))
 @app.post("/api/update_preview")
 async def update_preview(track: TrackData, user_id: int = Depends(get_user_id)):
     async with pool.acquire() as conn:
-        await conn.execute("UPDATE favorites SET preview=$1 WHERE user_id=$2 AND track_id=$3", track.preview, user_id, track.id)
-        await conn.execute("UPDATE library_tracks SET preview=$1 WHERE user_id=$2 AND track_id=$3", track.preview, user_id, track.id)
-        await conn.execute("UPDATE playlist_tracks SET preview=$1 WHERE playlist_id IN (SELECT id FROM playlists WHERE user_id=$2) AND track_id=$3", track.preview, user_id, track.id)
+        await conn.execute("UPDATE favorites SET preview=$1, source=COALESCE(NULLIF($2,''), source) WHERE user_id=$3 AND track_id=$4", track.preview, track.source, user_id, track.id)
+        await conn.execute("UPDATE library_tracks SET preview=$1, source=COALESCE(NULLIF($2,''), source) WHERE user_id=$3 AND track_id=$4", track.preview, track.source, user_id, track.id)
+        await conn.execute("UPDATE playlist_tracks SET preview=$1, source=COALESCE(NULLIF($2,''), source) WHERE playlist_id IN (SELECT id FROM playlists WHERE user_id=$3) AND track_id=$4", track.preview, track.source, user_id, track.id)
     return {"status": "ok"}
 
 @app.post("/api/playlists")
@@ -776,269 +776,6 @@ async def prewarm_ym(ym_id: str):
     except Exception: pass
 
 # ==========================================
-# ПРОВЕРКА РЕАЛЬНОЙ ДОСТУПНОСТИ АУДИО И FALLBACK ИСТОЧНИКОВ
-# ==========================================
-_track_probe_cache = {}
-_track_probe_inflight = {}
-_track_probe_semaphore = asyncio.Semaphore(8)
-_TRACK_PROBE_TTL = 180
-
-
-def _probe_cache_get(key):
-    entry = _track_probe_cache.get(key)
-    if not entry:
-        return None
-    ts, ok = entry
-    if time.time() - ts > _TRACK_PROBE_TTL:
-        _track_probe_cache.pop(key, None)
-        return None
-    return ok
-
-
-def _probe_cache_put(key, ok):
-    if len(_track_probe_cache) > 3000:
-        cutoff = time.time() - _TRACK_PROBE_TTL
-        for old_key, (ts, _) in list(_track_probe_cache.items()):
-            if ts < cutoff:
-                _track_probe_cache.pop(old_key, None)
-    _track_probe_cache[key] = (time.time(), bool(ok))
-
-
-async def _probe_audio_url(url: str) -> bool:
-    """Fetch only the first bytes; reject dead links and HTML/error pages."""
-    if not url or not str(url).startswith(('https://', 'http://')):
-        return False
-    try:
-        cli = get_http()
-        async with cli.stream(
-            'GET', str(url),
-            headers={'Range': 'bytes=0-4095', 'User-Agent': USER_AGENT, 'Accept': '*/*'},
-            timeout=httpx.Timeout(connect=7.0, read=10.0, write=7.0, pool=7.0),
-            follow_redirects=True,
-        ) as response:
-            if response.status_code not in (200, 206):
-                return False
-            ctype = (response.headers.get('content-type') or '').lower()
-            if any(x in ctype for x in ('text/html', 'text/plain', 'application/json', 'application/xml')):
-                return False
-            iterator = response.aiter_bytes()
-            try:
-                first = await iterator.__anext__()
-            except StopAsyncIteration:
-                return False
-            if not first or len(first) < 16:
-                return False
-            head = first[:512].lstrip().lower()
-            if head.startswith((b'<!doctype html', b'<html', b'{"error"', b'{"message"', b'<?xml')):
-                return False
-            # A non-empty binary response with a non-error HTTP status is a usable
-            # probe. Full decode is deliberately left to the playback client.
-            return True
-    except (httpx.HTTPError, OSError, ValueError) as exc:
-        print(f'[TRACK PROBE] audio URL failed: {type(exc).__name__}: {exc}')
-        return False
-    except Exception as exc:
-        print(f'[TRACK PROBE] unexpected audio probe error: {type(exc).__name__}: {exc}')
-        return False
-
-
-async def _probe_hls_url(url: str, depth: int = 0) -> bool:
-    """Validate an HLS playlist and at least one child playlist/segment."""
-    if not url or depth > 2:
-        return False
-    try:
-        cli = get_http()
-        response = await cli.get(
-            url,
-            headers={'Accept': 'application/vnd.apple.mpegurl,application/x-mpegURL,*/*', 'User-Agent': USER_AGENT},
-            timeout=httpx.Timeout(connect=7.0, read=12.0, write=7.0, pool=7.0),
-            follow_redirects=True,
-        )
-        if response.status_code != 200:
-            return False
-        body = response.text.lstrip('\ufeff\n\r ')
-        if not body.startswith('#EXTM3U'):
-            return False
-        child = next((line.strip() for line in body.splitlines() if line.strip() and not line.lstrip().startswith('#')), None)
-        if not child:
-            # A valid live playlist may temporarily have no segments.
-            return '#EXT-X-ENDLIST' not in body
-        child_url = urljoin(str(response.url), child)
-        path = urlparse(child_url).path.lower()
-        if path.endswith(('.m3u8', '.m3u')):
-            return await _probe_hls_url(child_url, depth + 1)
-        return await _probe_audio_url(child_url)
-    except (httpx.HTTPError, OSError, ValueError) as exc:
-        print(f'[TRACK PROBE] HLS failed: {type(exc).__name__}: {exc}')
-        return False
-    except Exception as exc:
-        print(f'[TRACK PROBE] unexpected HLS probe error: {type(exc).__name__}: {exc}')
-        return False
-
-
-async def _track_is_playable(track: dict) -> bool:
-    """Resolve the provider and verify that its actual stream responds with audio."""
-    source = str(track.get('source') or '')
-    ext_id = str(track.get('ext_id') or track.get('ym_id') or '')
-    cache_key = (source, ext_id, str(track.get('audio_url') or ''))
-    cached = _probe_cache_get(cache_key)
-    if cached is not None:
-        return cached
-    pending = _track_probe_inflight.get(cache_key)
-    if pending:
-        return await pending
-
-    async def run_probe():
-        async with _track_probe_semaphore:
-            try:
-                if source == 'soundcloud':
-                    if not ext_id:
-                        return False
-                    await prewarm_sc(ext_id)
-                    resolved = _sc_resolve_cache.get(ext_id)
-                    if not resolved:
-                        return False
-                    if resolved.get('type') == 'hls':
-                        ok = await _probe_hls_url(resolved.get('url', ''))
-                    elif resolved.get('type') == 'direct':
-                        ok = await _probe_audio_url(resolved.get('url', ''))
-                    else:
-                        ok = False
-                elif source == 'yandex':
-                    if not ext_id:
-                        return False
-                    await prewarm_ym(ext_id)
-                    link = _cache_get(_ym_link_cache, ext_id)
-                    ok = await _probe_audio_url(link) if link else False
-                elif source == 'muzofond':
-                    ok = await _probe_audio_url(track.get('audio_url') or '')
-                else:
-                    ok = False
-                _probe_cache_put(cache_key, ok)
-                return ok
-            except Exception as exc:
-                print(f'[TRACK PROBE] {source}/{ext_id}: {type(exc).__name__}: {exc}')
-                _probe_cache_put(cache_key, False)
-                return False
-
-    task = asyncio.create_task(run_probe())
-    _track_probe_inflight[cache_key] = task
-    try:
-        return await task
-    finally:
-        if _track_probe_inflight.get(cache_key) is task:
-            _track_probe_inflight.pop(cache_key, None)
-
-
-def _track_match_score(wanted_title: str, wanted_artist: str, wanted_duration: int, item: dict):
-    got_title = _match_text(item.get('title', ''))
-    title_score = difflib.SequenceMatcher(None, wanted_title, got_title).ratio()
-    got_artist = _match_text(item.get('artist', ''))
-    artist_score = difflib.SequenceMatcher(None, wanted_artist, got_artist).ratio() if wanted_artist else 1.0
-    got_duration = int(item.get('duration') or 0)
-    duration_ok = not wanted_duration or not got_duration or abs(wanted_duration - got_duration) <= max(20, int(wanted_duration * 0.12))
-    if title_score < 0.84 or not duration_ok:
-        return None
-    if wanted_artist and artist_score < 0.35 and title_score < 0.96:
-        return None
-    return title_score * 0.78 + artist_score * 0.17 + (0.05 if duration_ok else 0)
-
-
-async def _fallback_candidates(track: dict) -> list:
-    """Search other enabled providers for the same title/artist if the first stream is dead."""
-    title = norm(track.get('title') or '')
-    artist = norm(track.get('artist') or '')
-    if not title:
-        return []
-    query = (artist + ' ' + title).strip()
-    original_source = str(track.get('source') or '')
-    tasks = []
-    if ENABLE_MUZOFOND and original_source != 'muzofond':
-        tasks.append(asyncio.create_task(muzofond_search(query, 10)))
-    if ENABLE_YANDEX and original_source != 'yandex':
-        tasks.append(asyncio.create_task(yandex_search(query, 10)))
-    if ENABLE_SOUNDCLOUD and original_source != 'soundcloud':
-        tasks.append(asyncio.create_task(soundcloud_search(query, 10)))
-    if not tasks:
-        return []
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    wt, wa, wd = _match_text(title), _match_text(artist), int(track.get('duration') or 0)
-    candidates = []
-    for group in results:
-        if isinstance(group, Exception) or not group:
-            continue
-        for item in group:
-            if item.get('full') is False or item.get('source') in ('itunes', 'deezer'):
-                continue
-            score = _track_match_score(wt, wa, wd, item)
-            if score is not None:
-                candidates.append((score, item))
-    candidates.sort(key=lambda pair: pair[0], reverse=True)
-    return [item for _, item in candidates[:12]]
-
-
-async def _packed_track_is_playable(track: dict) -> bool:
-    source = str(track.get('source') or '')
-    ext_id = str(track.get('ext_id') or track.get('ym_id') or '')
-    if source == 'soundcloud':
-        await prewarm_sc(ext_id)
-        resolved = _sc_resolve_cache.get(ext_id)
-        if not resolved:
-            return False
-        if resolved.get('type') == 'hls':
-            return await _probe_hls_url(resolved.get('url', ''))
-        return await _probe_audio_url(resolved.get('url', '')) if resolved.get('type') == 'direct' else False
-    if source == 'yandex':
-        await prewarm_ym(ext_id)
-        link = _cache_get(_ym_link_cache, ext_id)
-        return await _probe_audio_url(link) if link else False
-    if source == 'muzofond':
-        stream = str(track.get('stream_url') or track.get('preview_url') or '')
-        token = stream.rsplit('/api/stream/', 1)[-1] if '/api/stream/' in stream else ''
-        if not token:
-            return False
-        try:
-            return await _probe_audio_url(unsign(token))
-        except HTTPException:
-            return False
-    return False
-
-
-async def _verified_search_tracks(candidates: list, term: str, limit: int) -> list:
-    """Keep only playable tracks; try another provider for a failed result."""
-    ranked = rank(candidates, term)
-    # Probe extra candidates so broken providers do not leave the user with an empty list.
-    ranked = ranked[:max(limit * 3, 30)]
-    groups = {}
-    for item in ranked:
-        key = (_match_text(item.get('title', '')), _match_text(item.get('artist', '')))
-        groups.setdefault(key, []).append(item)
-
-    async def choose(group):
-        for item in group:
-            if await _track_is_playable(item):
-                return item
-        # No candidate from the initial search worked. Query alternate APIs for
-        # this exact song, then accept only a close title/artist/duration match.
-        seed = group[0] if group else None
-        if not seed:
-            return None
-        for item in await _fallback_candidates(seed):
-            if await _track_is_playable(item):
-                return item
-        return None
-
-    selected = await asyncio.gather(*(choose(group) for group in groups.values()), return_exceptions=True)
-    out = []
-    for item in selected:
-        if isinstance(item, Exception) or not item:
-            continue
-        out.append(item)
-        if len(out) >= limit:
-            break
-    return rank(out, term)[:limit]
-
-# ==========================================
 # ЭНДПОИНТЫ ПОИСКА (С КЕШЕМ)
 # ==========================================
 @app.get("/api/search")
@@ -1050,13 +787,7 @@ async def search(q: Optional[str] = Query(None), query: Optional[str] = Query(No
         cache_key = f"{term}_{limit}"
         cached = _cache_get(_search_cache, cache_key)
         if cached is not None:
-            cached_tracks = cached.get('tracks') or []
-            checks = await asyncio.gather(*(_packed_track_is_playable(t) for t in cached_tracks), return_exceptions=True)
-            if cached_tracks and all(result is True for result in checks):
-                return cached
-            # Cached stream may have expired upstream; rebuild the result and
-            # search alternative providers instead of returning a dead item.
-            _search_cache.pop(cache_key, None)
+            return cached
 
         tasks = []
         if ENABLE_MUZOFOND: tasks.append(asyncio.create_task(muzofond_search(term, limit)))
@@ -1080,7 +811,7 @@ async def search(q: Optional[str] = Query(None), query: Optional[str] = Query(No
                     if not res: continue
                     for t in res:
                         if not _usable(t): continue
-                        key = (str(t.get("source") or ""), str(t.get("ext_id") or t.get("ym_id") or t.get("audio_url") or ""))
+                        key = (str(t.get("artist") or "").lower(), str(t.get("title") or "").lower())
                         if key in seen: continue
                         seen.add(key); merged.append(t)
                 except BaseException: continue
@@ -1100,9 +831,7 @@ async def search(q: Optional[str] = Query(None), query: Optional[str] = Query(No
             _collect(done)
         leftovers = set(pending)   # НЕ отменяем — их дособерёт _finish_search
 
-        # Проверяем фактическую доступность потока до показа результата.
-        # Если один API не отдаёт аудио, _verified_search_tracks пробует другой.
-        merged = await _verified_search_tracks(merged, term, limit)
+        merged = rank(merged, term)[:limit]
         result_tracks = [pack(t) for t in merged]
         response_data = {"tracks": result_tracks}
 
@@ -1138,12 +867,12 @@ async def _finish_search(cache_key, pending, merged, seen, term, limit):
                 if not res: continue
                 for t in res:
                     if t.get("full") is False or t.get("source") in ("itunes", "deezer"): continue
-                    key = (str(t.get("source") or ""), str(t.get("ext_id") or t.get("ym_id") or t.get("audio_url") or ""))
+                    key = (str(t.get("artist") or "").lower(), str(t.get("title") or "").lower())
                     if key in seen: continue
                     seen.add(key); merged.append(t)
             except BaseException: continue
         for task in pending: task.cancel()
-        full = await _verified_search_tracks(merged, term, limit)
+        full = rank(merged, term)[:limit]
         packed = []
         for t in full:
             try: packed.append(pack(t))
@@ -1170,29 +899,14 @@ def _match_text(value: str) -> str:
     return re.sub(r"[^\w\s]", " ", value, flags=re.U)
 
 @app.get("/api/track/resolve")
-async def resolve_full_track(title: str = Query(...), artist: str = Query(""), duration: int = Query(0, ge=0)):
+async def resolve_full_track(title: str = Query(...), artist: str = Query(""), duration: int = Query(0, ge=0), exclude_source: str = Query("")):
     title, artist = norm(title), norm(artist)
     if not title:
         raise HTTPException(status_code=400, detail="Track title is required")
-    cache_key = (_match_text(title), _match_text(artist))
+    cache_key = (_match_text(title), _match_text(artist), _match_text(exclude_source))
     cached = _cache_get(_track_resolve_cache, cache_key)
     if cached is not None:
-        # Do not trust an old cached match if its stream has since expired.
-        if cached.get('source') == 'soundcloud':
-            source_id = str(cached.get('ext_id') or '')
-            await prewarm_sc(source_id)
-            resolved = _sc_resolve_cache.get(source_id)
-            if resolved and (await (_probe_hls_url(resolved.get('url', '')) if resolved.get('type') == 'hls' else _probe_audio_url(resolved.get('url', '')))):
-                return cached
-        elif cached.get('source') == 'yandex':
-            await prewarm_ym(str(cached.get('ym_id') or cached.get('ext_id') or ''))
-            link = _cache_get(_ym_link_cache, str(cached.get('ym_id') or cached.get('ext_id') or ''))
-            if link and await _probe_audio_url(link):
-                return cached
-        elif cached.get('source') == 'muzofond':
-            # Packed Muzofond results use a signed proxy URL; re-search below to
-            # refresh the source URL instead of probing the stale proxy token.
-            pass
+        return cached
 
     query = (artist + " " + title).strip()
     tasks = []
@@ -1212,22 +926,37 @@ async def resolve_full_track(title: str = Query(...), artist: str = Query(""), d
         for item in group:
             if item.get("full") is False or item.get("source") in ("itunes", "deezer"):
                 continue
+            if exclude_source and item.get("source") == exclude_source:
+                continue
             if not (item.get("audio_url") or item.get("ym_id") or (item.get("source") == "soundcloud" and item.get("ext_id"))):
                 continue
-            score = _track_match_score(wanted_title, wanted_artist, duration, item)
-            if score is not None:
-                candidates.append((score, item))
-
-    candidates.sort(key=lambda pair: pair[0], reverse=True)
-    for _, chosen in candidates:
-        if await _track_is_playable(chosen):
-            packed = pack(chosen)
-            if not packed.get("preview"):
+            got_title = _match_text(item.get("title", ""))
+            title_score = difflib.SequenceMatcher(None, wanted_title, got_title).ratio()
+            got_artist = _match_text(item.get("artist", ""))
+            artist_score = difflib.SequenceMatcher(None, wanted_artist, got_artist).ratio() if wanted_artist else 1.0
+            got_duration = int(item.get("duration") or 0)
+            duration_ok = not duration or not got_duration or abs(duration - got_duration) <= max(20, int(duration * 0.12))
+            # Reject different songs and obvious remix/cover matches.
+            if title_score < 0.84 or not duration_ok:
                 continue
-            _cache_put(_track_resolve_cache, cache_key, packed)
-            return packed
+            if wanted_artist and artist_score < 0.35 and title_score < 0.96:
+                continue
+            score = title_score * 0.78 + artist_score * 0.17 + (0.05 if duration_ok else 0)
+            candidates.append((score, item))
 
-    raise HTTPException(status_code=404, detail="Full playable version not found for this album track")
+    if not candidates:
+        raise HTTPException(status_code=404, detail="Full version not found for this album track")
+    candidates.sort(key=lambda pair: pair[0], reverse=True)
+    packed = pack(candidates[0][1])
+    if not packed.get("preview"):
+        raise HTTPException(status_code=404, detail="Full audio stream is unavailable")
+    _cache_put(_track_resolve_cache, cache_key, packed)
+    chosen = candidates[0][1]
+    if chosen.get("source") == "soundcloud":
+        asyncio.create_task(prewarm_sc(chosen.get("ext_id")))
+    elif chosen.get("source") == "yandex":
+        asyncio.create_task(prewarm_ym(chosen.get("ym_id")))
+    return packed
 
 # ==========================================
 # АЛЬБОМЫ (С КЕШЕМ)
