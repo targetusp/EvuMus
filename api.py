@@ -39,10 +39,31 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 pool: Optional[asyncpg.Pool] = None
 _http: Optional[httpx.AsyncClient] = None
 
-# Кеши
+# Кеши (TTL, автоматическая очистка)
 _search_cache = {}
 _album_cache = {}
+_album_search_cache = {}
 _sc_resolve_cache = {}
+_ym_link_cache = {}
+
+_CACHE_TTL = 900        # 15 минут
+_CACHE_MAX = 600        # максимум записей на кеш
+
+def _cache_get(cache, key):
+    ent = cache.get(key)
+    if not ent: return None
+    ts, val = ent
+    if time.time() - ts > _CACHE_TTL:
+        cache.pop(key, None)
+        return None
+    return val
+
+def _cache_put(cache, key, val):
+    if len(cache) >= _CACHE_MAX:
+        # выкидываем ~10% самых старых записей
+        stale = sorted(cache.items(), key=lambda kv: kv[1][0])[:max(1, _CACHE_MAX // 10)]
+        for k, _ in stale: cache.pop(k, None)
+    cache[key] = (time.time(), val)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -484,6 +505,23 @@ async def yandex_search(query: str, limit: int) -> list:
         return rank(res, query)[:limit]
     except Exception: return []
 
+def _ym_resolve_link(ym_id: str) -> Optional[str]:
+    client = get_ym()
+    if not client: return None
+    tracks = client.tracks([ym_id])
+    if not tracks: return None
+    info = tracks[0].get_download_info()
+    if not info: return None
+    return max(info, key=lambda x: x.bitrate_in_kbps or 0).get_direct_link()
+
+async def prewarm_ym(ym_id: str):
+    """Заранее резолвит прямую ссылку Яндекс.Музыки, чтобы play стартовал мгновенно."""
+    if not ym_id or _cache_get(_ym_link_cache, ym_id): return
+    try:
+        link = await asyncio.to_thread(_ym_resolve_link, ym_id)
+        if link: _cache_put(_ym_link_cache, ym_id, link)
+    except Exception: pass
+
 # ==========================================
 # ЭНДПОИНТЫ ПОИСКА (С КЕШЕМ)
 # ==========================================
@@ -494,41 +532,108 @@ async def search(q: Optional[str] = Query(None), query: Optional[str] = Query(No
         if not term: return {"tracks": []}
         
         cache_key = f"{term}_{limit}"
-        if cache_key in _search_cache:
-            return _search_cache[cache_key]
+        cached = _cache_get(_search_cache, cache_key)
+        if cached is not None:
+            return cached
 
         tasks = []
         if ENABLE_MUZOFOND: tasks.append(asyncio.create_task(muzofond_search(term, limit)))
         if ENABLE_YANDEX: tasks.append(asyncio.create_task(yandex_search(term, limit)))
         if ENABLE_SOUNDCLOUD: tasks.append(asyncio.create_task(soundcloud_search(term, limit)))
-        
-        done, pending = await asyncio.wait(tasks, timeout=1.5)
-        for task in pending: task.cancel()
-            
+
+        if not tasks: return {"tracks": []}
+
         merged, seen = [], set()
-        for task in done:
-            try:
-                res = task.result()
-                if not res: continue
-                for t in res:
-                    key = (str(t.get("artist") or "").lower(), str(t.get("title") or "").lower())
-                    if key in seen: continue
-                    seen.add(key); merged.append(t)
-            except Exception: continue
-        
-        merged = [t for t in merged if t.get("full") is not False and t.get("source") not in ("itunes", "deezer")]
+
+        def _usable(t):
+            return t.get("full") is not False and t.get("source") not in ("itunes", "deezer")
+
+        def _collect(chunk):
+            # Фильтруем сразу: ранний выход должен опираться только на
+            # треки, которые реально дойдут до пользователя.
+            for task in chunk:
+                try:
+                    if task.cancelled(): continue
+                    res = task.result()
+                    if not res: continue
+                    for t in res:
+                        if not _usable(t): continue
+                        key = (str(t.get("artist") or "").lower(), str(t.get("title") or "").lower())
+                        if key in seen: continue
+                        seen.add(key); merged.append(t)
+                except BaseException: continue
+
+        # Отдаём результат сразу, как только есть что показать.
+        # Медленные источники (Yandex 2-4с) догоняют в фоне и дополняют кеш.
+        start = time.monotonic()
+        soft_deadline = start + 1.6   # уже есть что показать — не ждём медленных
+        hard_deadline = start + 3.0   # совсем пусто — даём шанс всем источникам
+        pending = set(tasks)
+        while pending and len(merged) < limit:
+            now = time.monotonic()
+            if len(merged) >= 6 and (now - start) >= 0.4: break   # быстрый ответ
+            ceiling = soft_deadline if merged else hard_deadline
+            if now >= ceiling: break
+            done, pending = await asyncio.wait(pending, timeout=ceiling - now, return_when=asyncio.FIRST_COMPLETED)
+            _collect(done)
+        leftovers = set(pending)   # НЕ отменяем — их дособерёт _finish_search
+
         merged = rank(merged, term)[:limit]
         result_tracks = [pack(t) for t in merged]
         response_data = {"tracks": result_tracks}
-        
-        _search_cache[cache_key] = response_data
-        
-        for t in merged[:5]:
+
+        # Пустой результат не кешируем, чтобы повторный поиск не залипал в "ничего не найдено"
+        if result_tracks:
+            _cache_put(_search_cache, cache_key, response_data)
+
+        # Фоновое уточнение: дособираем медленные источники и обновим кеш,
+        # чтобы повторный запрос того же трека вернул полный список.
+        if leftovers:
+            asyncio.create_task(_finish_search(cache_key, leftovers, merged, seen, term, limit))
+
+        # Заранее резолвим ссылки, чтобы воспроизведение стартовало мгновенно
+        for t in merged:
             if t.get("source") == "soundcloud" and t.get("ext_id"):
                 asyncio.create_task(prewarm_sc(t["ext_id"]))
-                
+            elif t.get("source") == "yandex" and t.get("ym_id"):
+                asyncio.create_task(prewarm_ym(t["ym_id"]))
+
         return response_data
     except Exception: return {"tracks": []}
+
+
+async def _finish_search(cache_key, pending, merged, seen, term, limit):
+    """Дособирает источники, которые не успели, и дополняет кеш."""
+    if not pending: return
+    try:
+        done, pending = await asyncio.wait(pending, timeout=3.0)
+        for task in done:
+            try:
+                if task.cancelled(): continue
+                res = task.result()
+                if not res: continue
+                for t in res:
+                    if t.get("full") is False or t.get("source") in ("itunes", "deezer"): continue
+                    key = (str(t.get("artist") or "").lower(), str(t.get("title") or "").lower())
+                    if key in seen: continue
+                    seen.add(key); merged.append(t)
+            except BaseException: continue
+        for task in pending: task.cancel()
+        full = rank(merged, term)[:limit]
+        packed = []
+        for t in full:
+            try: packed.append(pack(t))
+            except Exception: continue
+        if not packed: return
+        _cache_put(_search_cache, cache_key, {"tracks": packed})
+        for t in full:
+            try:
+                if t.get("source") == "soundcloud" and t.get("ext_id"):
+                    asyncio.create_task(prewarm_sc(t["ext_id"]))
+                elif t.get("source") == "yandex" and t.get("ym_id"):
+                    asyncio.create_task(prewarm_ym(t["ym_id"]))
+            except Exception: continue
+    except BaseException: pass
 
 # ==========================================
 # АЛЬБОМЫ (С КЕШЕМ)
@@ -538,6 +643,9 @@ async def search_albums(q: Optional[str] = Query(None), query: Optional[str] = Q
     term = norm(q or query or "")
     if not term: return {"albums": []}
     try:
+        cache_key = f"{term}_{limit}"
+        cached = _cache_get(_album_search_cache, cache_key)
+        if cached is not None: return cached
         r = await get_http().get(ITUNES_API + "/search", params={"term": term, "entity": "album", "limit": limit})
         if r.status_code != 200: return {"albums": []}
         data = r.json()
@@ -547,17 +655,20 @@ async def search_albums(q: Optional[str] = Query(None), query: Optional[str] = Q
             albums.append({
                 "id": str(album.get("collectionId", "")), "title": album.get("collectionName", ""),
                 "artist": album.get("artistName", "Неизвестен"), "cover": cover,
-                "track_count": album.get("trackCount", 0), "release_date": album.get("releaseDate", "")[:10], "source": "itunes",
+                "track_count": album.get("trackCount", 0), "release_date": (album.get("releaseDate") or "")[:10], "source": "itunes",
             })
-        return {"albums": albums}
+        resp = {"albums": albums}
+        _cache_put(_album_search_cache, cache_key, resp)
+        return resp
     except Exception: return {"albums": []}
 
 @app.get("/api/itunes/album/{album_id}")
 async def get_album(album_id: str):
     if not album_id.isdigit(): raise HTTPException(status_code=400, detail="Invalid ID")
     
-    if album_id in _album_cache:
-        return _album_cache[album_id]
+    cached = _cache_get(_album_cache, album_id)
+    if cached is not None:
+        return cached
 
     try:
         r = await get_http().get(ITUNES_API + "/lookup", params={"id": album_id, "entity": "song"})
@@ -575,7 +686,7 @@ async def get_album(album_id: str):
             })
         result = {"album": {"id": str(album_info.get("collectionId", "")), "title": album_info.get("collectionName", ""), "artist": album_info.get("artistName", ""), "cover": album_info.get("artworkUrl100", "").replace("100x100bb", "600x600bb")}, "tracks": tracks}
         
-        _album_cache[album_id] = result
+        _cache_put(_album_cache, album_id, result)
         return result
     except Exception: raise HTTPException(status_code=502, detail="Error")
 
@@ -613,16 +724,14 @@ async def stream(token: str, request: Request):
 
 @app.api_route("/api/audio/{ym_id}", methods=["GET", "HEAD", "OPTIONS"])
 async def yandex_audio(ym_id: str, request: Request):
-    def resolve():
-        client = get_ym()
-        if not client: raise Exception("Yandex client not initialized")
-        tracks = client.tracks([ym_id])
-        if not tracks: raise Exception("Track not found")
-        info = tracks[0].get_download_info()
-        if not info: raise Exception("No download info")
-        return max(info, key=lambda x: x.bitrate_in_kbps or 0).get_direct_link()
-    try: link = await asyncio.to_thread(resolve)
-    except Exception as e: raise HTTPException(status_code=502, detail=str(e))
+    link = _cache_get(_ym_link_cache, ym_id)
+    if not link:
+        try:
+            link = await asyncio.to_thread(_ym_resolve_link, ym_id)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=str(e))
+        if not link: raise HTTPException(status_code=502, detail="No download info")
+        _cache_put(_ym_link_cache, ym_id, link)
     headers = {"Range": request.headers["range"]} if request.headers.get("range") else {}
     req = get_http().build_request("GET", link, headers=headers); upstream = await get_http().send(req, stream=True)
     out_headers = {"Content-Type": "audio/mpeg", "Accept-Ranges": "bytes", "Access-Control-Allow-Origin": "*"}

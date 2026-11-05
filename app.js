@@ -200,15 +200,44 @@
   // ===== Поиск =====
   function absUrl(u) { if (!u) return ''; if (u.indexOf('http') === 0) return u; return API_URL + u; }
 
+  // Кеши: повторный поиск отрисовывается мгновенно, данные обновляются в фоне
+  var searchCache = {};     // query -> tracks[]
+  var albumCache = {};      // query -> albums[]
+  var albumTracksCache = {}; // albumId -> data
+
+  function mapTracks(d) {
+    return (d.tracks || []).map(function (t) {
+      var dur = t.dur || (t.duration ? Math.floor(t.duration / 60) + ':' + ('0' + (t.duration % 60)).slice(-2) : '');
+      return { id: String(t.id), title: t.title, artist: t.artist || '', dur: dur, cover: absUrl(t.cover || ''), preview: absUrl(t.preview_url || t.preview || t.stream_url || ''), full: t.full !== false, source: t.source || 'ru' };
+    }).filter(function (t) { return !!t.preview && t.full !== false; });
+  }
+
   function fetchTracks(query) {
+    if (searchCache[query] && searchCache[query].length) return Promise.resolve(searchCache[query]);
     var url = API_URL + '/api/search?q=' + encodeURIComponent(query);
     return fetch(url).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }).then(function (d) {
-      return (d.tracks || []).map(function (t) {
-        var dur = t.dur || (t.duration ? Math.floor(t.duration / 60) + ':' + ('0' + (t.duration % 60)).slice(-2) : '');
-        return { id: String(t.id), title: t.title, artist: t.artist || '', dur: dur, cover: absUrl(t.cover || ''), preview: absUrl(t.preview_url || t.preview || t.stream_url || ''), full: t.full !== false, source: t.source || 'ru' };
-      }).filter(function (t) { return !!t.preview && t.full !== false; });
+      var tracks = mapTracks(d);
+      if (tracks.length) searchCache[query] = tracks;   // пустое не кешируем
+      return tracks;
     });
   }
+
+  // Фоновое обновление кеша (не блокирует отрисовку)
+  function revalidateTracks(query) {
+    var url = API_URL + '/api/search?q=' + encodeURIComponent(query);
+    fetch(url).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }).then(function (d) {
+      var tracks = mapTracks(d);
+      if (!tracks.length) return;
+      var prev = searchCache[query];
+      searchCache[query] = tracks;
+      // перерисовываем, если результат изменился (в т.ч. «пусто → есть»)
+      // и это всё ещё активный запрос
+      var changed = !prev || JSON.stringify(prev) !== JSON.stringify(tracks);
+      if (changed && inputValue() === query) renderSearch();
+    }).catch(function () {});
+  }
+
+  function inputValue() { var i = $('#searchInput'); return i ? (i.value || '').trim() : ''; }
 
   // ===== ФОНОВОЕ ВОССТАНОВЛЕНИЕ =====
   var restorePromises = {};
@@ -320,9 +349,16 @@
   }
 
   var preloadedAudios = {};
+  // Лёгкий прогрев HTTP-кеша (только начало файла) — не создаёт Audio-элемент
+  var warmedUrls = {};
+  function warmUrl(url) {
+    if (!url || warmedUrls[url]) return;
+    warmedUrls[url] = true;
+    fetch(url, { headers: { 'Range': 'bytes=0-131072' }, cache: 'force-cache' }).catch(function(){});
+  }
   function preloadAudio(url) {
     if (!url || preloadedAudios[url]) return;
-    fetch(url, { headers: { 'Range': 'bytes=0-100000' }, cache: 'force-cache' }).catch(function(){});
+    warmUrl(url);
     var audio = new Audio();
     audio.preload = 'auto';
     audio.src = url;
@@ -354,7 +390,17 @@
     container.innerHTML = tracks.map(trackHTML).join(''); 
     hydrateTrackCovers(container); 
     updateRowPlayState(); 
-    tracks.slice(0, 5).forEach(function(t) { if (t.preview) preloadAudio(t.preview); });
+    // Прогреваем кеш начала файла для первых треков — play стартует сразу
+    tracks.slice(0, 10).forEach(function(t) { if (t.preview) warmUrl(t.preview); });
+    // Полная предзагрузка только ближайших, чтобы не тратить трафик
+    tracks.slice(0, 3).forEach(function(t) { if (t.preview) preloadAudio(t.preview); });
+    // Наведение на трек = прогрев его ссылки, клик играет без задержки
+    container.querySelectorAll('.track').forEach(function(row) {
+      var t = trackRegistry[row.getAttribute('data-id')];
+      if (t && t.preview) {
+        row.addEventListener('mouseenter', function() { warmUrl(t.preview); }, { once: true, passive: true });
+      }
+    });
     setTimeout(setupAnimations, 50);
   }
 
@@ -376,20 +422,50 @@
     if (searchTab === 'albums') { renderAlbumSearch(q); renderCollection(); return; }
     
     var empty = $('#searchEmpty'); if(empty) empty.hidden = true; 
-    var res = $('#searchResults'); if(res) res.innerHTML = '<div class="search-hint">Ищу треки…</div>';
+    var res = $('#searchResults'); if(!res) { renderCollection(); return; }
     
-    if (!q) { if(res) res.innerHTML = ''; if(empty) { empty.hidden = false; empty.innerHTML = '<p>Начни вводить название</p>'; } renderCollection(); return; }
+    if (!q) { res.innerHTML = ''; if(empty) { empty.hidden = false; empty.innerHTML = '<p>Начни вводить название</p>'; } renderCollection(); return; }
     
     var reqId = ++searchRequestId;
-    fetchTracks(q).then(function (tracks) {
-      if (reqId !== searchRequestId) return; tracks.forEach(registerTrack);
-      if (!tracks || !tracks.length) { if(empty) { empty.hidden = false; empty.innerHTML = '<p>Ничего не найдено по «' + esc(q) + '»</p>'; } if(res) res.innerHTML = ''; return; }
-      if(empty) empty.hidden = true; renderList(res, tracks);
-    }).catch(function () { if (reqId !== searchRequestId) return; if(empty) { empty.hidden = false; empty.innerHTML = '<p>Ошибка поиска</p>'; } if(res) res.innerHTML = ''; });
+    var cached = searchCache[q];
+
+    function paint(tracks) {
+      if (reqId !== searchRequestId) return;
+      tracks.forEach(registerTrack);
+      if (!tracks || !tracks.length) {
+        if(empty) { empty.hidden = false; empty.innerHTML = '<p>Ничего не найдено по «' + esc(q) + '»</p>'; }
+        res.innerHTML = ''; return;
+      }
+      if(empty) empty.hidden = true;
+      renderList(res, tracks);
+    }
+
+    if (cached) {
+      // Мгновенно из кеша, затем тихое обновление в фоне
+      paint(cached);
+      revalidateTracks(q);
+    } else {
+      res.innerHTML = '<div class="search-hint">Ищу треки…</div>';
+      fetchTracks(q).then(paint).catch(function () {
+        if (reqId !== searchRequestId) return;
+        if(empty) { empty.hidden = false; empty.innerHTML = '<p>Ошибка поиска</p>'; }
+        res.innerHTML = '';
+      }).then(function () {
+        // Источники бывают медленными: если вышло пусто — перепроверим
+        // через паузу, когда сервер дособерёт оставшиеся источники.
+        if (reqId !== searchRequestId) return;
+        if (!searchCache[q] || !searchCache[q].length) {
+          setTimeout(function () {
+            if (reqId !== searchRequestId || inputValue() !== q) return;
+            revalidateTracks(q);
+          }, 2500);
+        }
+      });
+    }
     renderCollection();
   }
 
-  $('#searchInput').addEventListener('input', function () { clearTimeout(searchTimer); searchTimer = setTimeout(renderSearch, 700); });
+  $('#searchInput').addEventListener('input', function () { clearTimeout(searchTimer); searchTimer = setTimeout(renderSearch, 250); });
   $('#searchInput').addEventListener('keydown', function (e) { if (e.key === 'Enter') { clearTimeout(searchTimer); renderSearch(); } });
 
   // ===== Альбомы =====
@@ -397,26 +473,45 @@
   function renderAlbumSearch(query) {
     var results = $('#searchResults'); var empty = $('#searchEmpty');
     if (!query) { if(results) results.innerHTML = ''; if(empty) { empty.hidden = false; empty.innerHTML = '<p>Введи название</p>'; } return; }
-    var requestId = ++albumSearchRequestId; if(empty) empty.hidden = true; if(results) results.innerHTML = '<div class="search-hint">Ищу альбомы…</div>';
-    fetch(API_URL + '/api/search/albums?q=' + encodeURIComponent(query)).then(function(r) { return r.json(); }).then(function(data) {
+    var requestId = ++albumSearchRequestId; if(empty) empty.hidden = true;
+
+    function paint(items, fromCache) {
       if (requestId !== albumSearchRequestId || searchTab !== 'albums') return;
-      var items = data.albums || [];
       if (!items.length) { if(results) results.innerHTML = ''; if(empty) { empty.hidden = false; empty.innerHTML = '<p>Альбомы не найдены</p>'; } return; }
       if(empty) empty.hidden = true;
       if(results) {
         results.innerHTML = '<div class="search-album-grid">' + items.map(function(a) {
-          return '<button class="search-album-card animate-on-scroll" data-deezer-album="' + esc(a.id) + '"><img src="' + esc(absUrl(a.cover || '')) + '" alt="" loading="lazy"><span class="search-album-card__meta"><b>' + esc(a.title || 'Без названия') + '</b><small>' + esc(a.artist || 'Неизвестен') + '</small><small>' + esc(String(a.nb_tracks || 0)) + ' треков</small></span></button>';
+          return '<button class="search-album-card animate-on-scroll" data-deezer-album="' + esc(a.id) + '"><img src="' + esc(absUrl(a.cover || '')) + '" alt="" loading="lazy"><span class="search-album-card__meta"><b>' + esc(a.title || 'Без названия') + '</b><small>' + esc(a.artist || 'Неизвестен') + '</small><small>' + esc(String(a.nb_tracks || a.track_count || 0)) + ' треков</small></span></button>';
         }).join('') + '</div>';
         results.querySelectorAll('[data-deezer-album]').forEach(function(card) { card.addEventListener('click', function() { openAlbumTracks(card.getAttribute('data-deezer-album')); }); });
         setTimeout(setupAnimations, 50);
       }
+    }
+
+    var cached = albumCache[query];
+    if (cached) {
+      // Мгновенно из кеша, затем тихое обновление в фоне
+      paint(cached, true);
+      fetch(API_URL + '/api/search/albums?q=' + encodeURIComponent(query)).then(function(r) { return r.json(); }).then(function(data) {
+        var items = data.albums || [];
+        if (items.length) { albumCache[query] = items; if (JSON.stringify(items) !== JSON.stringify(cached)) paint(items); }
+      }).catch(function() {});
+      return;
+    }
+
+    if(results) results.innerHTML = '<div class="search-hint">Ищу альбомы…</div>';
+    fetch(API_URL + '/api/search/albums?q=' + encodeURIComponent(query)).then(function(r) { return r.json(); }).then(function(data) {
+      var items = data.albums || [];
+      if (items.length) albumCache[query] = items;
+      paint(items);
     }).catch(function() { if (requestId !== albumSearchRequestId) return; if(results) results.innerHTML = ''; if(empty) { empty.hidden = false; empty.innerHTML = '<p>Ошибка</p>'; } });
   }
 
   function openAlbumTracks(albumId) {
     var results = $('#searchResults'); var empty = $('#searchEmpty');
     if(results) results.innerHTML = '<div class="search-hint">Загружаю альбом…</div>'; if(empty) empty.hidden = true;
-    fetch(API_URL + '/api/itunes/album/' + encodeURIComponent(albumId)).then(function(r) { return r.json(); }).then(function(data) {
+
+    function render(data) {
       var tracks = (data.tracks || []).map(function(t) {
         var track = { id: 'itunes_' + t.id, title: t.title || 'Без названия', artist: t.artist || '', dur: t.dur || '', cover: absUrl(t.cover || ''), preview: t.preview || '', full: false, source: 'itunes' };
         registerTrack(track); return track;
@@ -426,6 +521,14 @@
         var db = $('#albumTracksBack'); if(db) db.addEventListener('click', function() { renderAlbumSearch(($('#searchInput').value || '').trim()); });
         renderList($('#albumTracksList'), tracks);
       }
+    }
+
+    var cached = albumTracksCache[albumId];
+    if (cached) { render(cached); return; }
+
+    fetch(API_URL + '/api/itunes/album/' + encodeURIComponent(albumId)).then(function(r) { return r.json(); }).then(function(data) {
+      if (data && data.tracks) albumTracksCache[albumId] = data;
+      render(data);
     }).catch(function() { if(results) results.innerHTML = '<p class="search-empty">Ошибка</p>'; });
   }
 
