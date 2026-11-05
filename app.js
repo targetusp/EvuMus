@@ -246,34 +246,43 @@
   async function restorePreview(tr, silent) {
     if (tr.preview) return true;
     if (restorePromises[tr.id]) return await restorePromises[tr.id];
-
-    restorePromises[tr.id] = (async function() {
-        if (!silent) toast('Восстанавливаю ссылку...');
-        try {
-          var res = await fetch(API_URL + '/api/search?q=' + encodeURIComponent((tr.artist || '') + ' ' + tr.title));
-          var data = await res.json();
-          if (data.tracks && data.tracks.length > 0) {
-              var newTrack = data.tracks[0];
-              var oldId = tr.id;
-              
-              tr.preview = newTrack.preview; 
-              tr.cover = newTrack.cover || tr.cover; 
-              tr.source = newTrack.source; 
-              
-              await fetch(API_URL + '/api/update_preview', {
-                  method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, getAuthHeader()),
-                  body: JSON.stringify({ id: String(oldId), title: tr.title, artist: tr.artist, preview: tr.preview })
-              });
-              
-              trackRegistry[oldId] = tr;
-              return true;
-          }
-        } catch (e) {}
-        if (!silent) toast('Не удалось найти превью');
+    restorePromises[tr.id] = (async function () {
+      if (!silent) toast('Восстанавливаю ссылку...');
+      try {
+        var response = await fetch(API_URL + '/api/search?q=' + encodeURIComponent((tr.artist || '') + ' ' + tr.title));
+        if (!response.ok) throw new Error('Search HTTP ' + response.status);
+        var data = await response.json();
+        var candidates = data && Array.isArray(data.tracks) ? data.tracks : [];
+        var wantedTitle = String(tr.title || '').trim().toLowerCase();
+        var wantedArtist = String(tr.artist || '').trim().toLowerCase();
+        var newTrack = candidates.find(function (candidate) {
+          return candidate && candidate.preview &&
+            String(candidate.title || '').trim().toLowerCase() === wantedTitle &&
+            (!wantedArtist || String(candidate.artist || '').trim().toLowerCase() === wantedArtist);
+        }) || candidates.find(function (candidate) { return candidate && candidate.preview; });
+        if (!newTrack || !newTrack.preview) throw new Error('No playable result');
+        var oldId = tr.id;
+        tr.preview = newTrack.preview;
+        tr.cover = newTrack.cover || tr.cover;
+        tr.source = newTrack.source || tr.source;
+        trackRegistry[oldId] = tr;
+        fetch(API_URL + '/api/update_preview', {
+          method: 'POST',
+          headers: Object.assign({ 'Content-Type': 'application/json' }, getAuthHeader()),
+          body: JSON.stringify({ id: String(oldId), title: tr.title, artist: tr.artist, preview: tr.preview })
+        }).catch(function (error) { console.warn('[EvuMusic] preview save failed:', error); });
+        return true;
+      } catch (error) {
+        console.warn('[EvuMusic] preview restore failed:', error);
+        if (!silent) toast('Не удалось восстановить ссылку на трек');
         return false;
+      }
     })();
-
-    return await restorePromises[tr.id];
+    try {
+      return await restorePromises[tr.id];
+    } finally {
+      delete restorePromises[tr.id];
+    }
   }
 
   async function restoreMissingPreviews() {
@@ -712,51 +721,120 @@
   window.__evuAudio = function () { return previewAudio; };
 
   function startAudio(url, t) {
-    if (previewAudio) { previewAudio.pause(); previewAudio = null; }
-    previewTrackId = String(t.id); 
-    
-    if (preloadedAudios[url]) {
-        previewAudio = preloadedAudios[url];
-        previewAudio.currentTime = 0;
-    } else {
-        previewAudio = new Audio(url);
-        previewAudio.preload = 'auto'; previewAudio.crossOrigin = 'anonymous'; previewAudio.load();
+    if (!url) {
+      toast('У этого трека нет ссылки на аудио');
+      setPlayingUI(false);
+      return;
     }
-    
-    previewAudio.volume = volume / 100; 
-    var playPromise = previewAudio.play(); if (playPromise && playPromise.catch) playPromise.catch(function () {});
-    showPlayer(t); setPlayingUI(true);
-    
-    previewAudio.onwaiting = function() {
-        var activeRow = document.querySelector('.track[data-id="' + previewTrackId + '"]');
-        if(activeRow) { var b = activeRow.querySelector('.js-play'); if(b) b.innerHTML = loaderSvg(); }
+    if (previewAudio) {
+      previewAudio.pause();
+      previewAudio.onplaying = previewAudio.onwaiting = previewAudio.onerror = null;
+      try { previewAudio.removeAttribute('src'); previewAudio.load(); } catch (e) {}
+    }
+    previewTrackId = String(t.id);
+    previewAudio = preloadedAudios[url] || new Audio();
+    delete preloadedAudios[url];
+    var audio = previewAudio;
+    audio.preload = 'auto';
+    audio.volume = volume / 100;
+    var absoluteUrl = new URL(url, window.location.href).href;
+    if (audio.src !== absoluteUrl) audio.src = url;
+    try { audio.currentTime = 0; } catch (e) {}
+    showPlayer(t);
+    setPlayingUI(false);
+    var activeRow = $$('.track').find(function (row) { return row.getAttribute('data-id') === previewTrackId; });
+    if (activeRow) {
+      var playButton = activeRow.querySelector('.js-play');
+      if (playButton) playButton.innerHTML = loaderSvg();
+    }
+    audio.onwaiting = function () {
+      if (previewAudio !== audio) return;
+      setPlayingUI(false);
+      var row = $$('.track').find(function (item) { return item.getAttribute('data-id') === previewTrackId; });
+      var button = row && row.querySelector('.js-play');
+      if (button) button.innerHTML = loaderSvg();
     };
-    previewAudio.onplaying = function() {
-        setPlayingUI(true);
+    audio.onplaying = function () {
+      if (previewAudio === audio) setPlayingUI(true);
     };
-
-    previewAudio.ontimeupdate = function () { 
-      if (previewAudio && !seekDrag) { 
-        var dur = previewAudio.duration;
-        if (!dur || !isFinite(dur) || dur === 0 || dur === 30) {
-            dur = parseDuration(t.dur) || 30;
-        }
-        var p = $('#playerProgress'); 
-        if(p) p.style.width = Math.min(100, (previewAudio.currentTime / dur * 100)) + '%'; 
-      } 
+    audio.onerror = function () {
+      if (previewAudio !== audio) return;
+      var code = audio.error ? audio.error.code : 0;
+      var messages = {
+        1: 'Загрузка аудио отменена',
+        2: 'Проблема сети при загрузке трека',
+        3: 'Не удалось декодировать аудио',
+        4: 'Источник не отдал поддерживаемый аудиоформат'
+      };
+      setPlayingUI(false);
+      toast(messages[code] || 'Не удалось загрузить трек');
     };
-    
-    previewAudio.onended = function () { var p = $('#playerProgress'); if(p) p.style.width = '0%'; var idx = queueIds.indexOf(previewTrackId); if (idx >= 0 && idx < queueIds.length - 1) { var nextT = (trackRegistry[queueIds[idx + 1]] || findTrack(queueIds[idx + 1])); if (nextT && nextT.preview) { playPreview(nextT); return; } } setPlayingUI(false); };
-    previewAudio.onplay = function () { setPlayingUI(true); }; previewAudio.onpause = function () { setPlayingUI(false); };
+    audio.ontimeupdate = function () {
+      if (previewAudio !== audio || seekDrag) return;
+      var duration = audio.duration;
+      if (!duration || !isFinite(duration) || duration === 0 || duration === 30) duration = parseDuration(t.dur) || 30;
+      var progress = $('#playerProgress');
+      if (progress) progress.style.width = Math.min(100, (audio.currentTime / duration * 100)) + '%';
+    };
+    audio.onended = function () {
+      if (previewAudio !== audio) return;
+      var progress = $('#playerProgress');
+      if (progress) progress.style.width = '0%';
+      var idx = queueIds.indexOf(previewTrackId);
+      if (idx >= 0 && idx < queueIds.length - 1) {
+        var nextTrack = trackRegistry[queueIds[idx + 1]] || findTrack(queueIds[idx + 1]);
+        if (nextTrack && nextTrack.preview) { playPreview(nextTrack); return; }
+      }
+      setPlayingUI(false);
+    };
+    audio.onpause = function () {
+      if (previewAudio === audio && !audio.ended) setPlayingUI(false);
+    };
+    var playPromise;
+    try {
+      playPromise = audio.play();
+    } catch (error) {
+      setPlayingUI(false);
+      toast('Браузер не смог запустить воспроизведение');
+      console.error('[EvuMusic] audio.play failed:', error);
+      return;
+    }
+    if (playPromise && typeof playPromise.catch === 'function') {
+      playPromise.catch(function (error) {
+        if (previewAudio !== audio) return;
+        setPlayingUI(false);
+        console.error('[EvuMusic] audio.play rejected:', error);
+        toast(error && error.name === 'NotAllowedError'
+          ? 'Браузер заблокировал запуск. Нажми Play ещё раз'
+          : 'Не удалось запустить трек. Проверь соединение');
+      });
+    }
   }
 
   function playPreview(t) {
-    if (previewAudio && previewTrackId === String(t.id)) { if (previewAudio.paused) { previewAudio.play(); setPlayingUI(true); } else { previewAudio.pause(); setPlayingUI(false); } return; }
+    if (!t || !t.preview) {
+      toast('Ссылка на аудио не найдена');
+      return;
+    }
+    if (previewAudio && previewTrackId === String(t.id)) {
+      if (previewAudio.paused) {
+        var resumePromise = previewAudio.play();
+        if (resumePromise && resumePromise.catch) {
+          resumePromise.catch(function (error) {
+            console.error('[EvuMusic] resume failed:', error);
+            toast('Не удалось продолжить воспроизведение');
+          });
+        }
+      } else {
+        previewAudio.pause();
+      }
+      return;
+    }
     var key = ((t.title || '') + '|' + (t.artist || '')).toLowerCase();
     if (trackCoverCache[key]) t.cover = trackCoverCache[key];
-    startAudio(t.preview, t); showPlayer(t); setPlayingUI(true);
+    startAudio(t.preview, t);
   }
-  
+
   function setPlayingUI(on) {
     playerState.playing = on; 
     var ip = $('#iconPlay'); if(ip) ip.toggleAttribute('hidden', on); 
