@@ -432,49 +432,87 @@ async def prewarm_sc(sc_id):
         }
     except Exception: pass
 
+async def _proxy_audio_url(url: str, request: Request, default_type: str = "audio/mpeg"):
+    cli = get_http()
+    headers = {}
+    if request.headers.get("range"):
+        headers["Range"] = request.headers["range"]
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "Range, Content-Type",
+        })
+    method = "HEAD" if request.method == "HEAD" else "GET"
+    try:
+        req = cli.build_request(method, url, headers=headers)
+        upstream = await cli.send(req, stream=(method != "HEAD"))
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Audio upstream error: {e}")
+    if upstream.status_code >= 400:
+        status = upstream.status_code
+        await upstream.aclose()
+        raise HTTPException(status_code=502, detail=f"Audio provider returned HTTP {status}")
+    out_headers = {
+        "Content-Type": upstream.headers.get("content-type", default_type),
+        "Accept-Ranges": upstream.headers.get("accept-ranges", "bytes"),
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "no-store",
+    }
+    for name in ("Content-Length", "Content-Range", "Last-Modified", "ETag"):
+        value = upstream.headers.get(name)
+        if value:
+            out_headers[name] = value
+    status_code = upstream.status_code
+    if method == "HEAD":
+        await upstream.aclose()
+        return Response(status_code=status_code, headers=out_headers)
+    async def body():
+        try:
+            async for chunk in upstream.aiter_raw(64 * 1024):
+                if chunk:
+                    yield chunk
+        finally:
+            await upstream.aclose()
+    return StreamingResponse(body(), status_code=status_code, headers=out_headers)
+
+
 @app.api_route("/api/sc/{sc_id}", methods=["GET", "HEAD", "OPTIONS"])
 async def soundcloud_audio(sc_id: str, request: Request):
-    if not ENABLE_SOUNDCLOUD: raise HTTPException(status_code=503, detail="SoundCloud disabled")
-    
+    if not ENABLE_SOUNDCLOUD:
+        raise HTTPException(status_code=503, detail="SoundCloud disabled")
     if sc_id not in _sc_resolve_cache:
         await prewarm_sc(sc_id)
-    
     cached = _sc_resolve_cache.get(sc_id)
     if not cached:
-        raise HTTPException(status_code=404, detail="Stream not found")
-
-    cli = get_http()
-
+        raise HTTPException(status_code=404, detail="SoundCloud stream could not be resolved")
     if cached["type"] == "direct":
-        headers = {"Range": request.headers["range"]} if request.headers.get("range") else {}
-        req = cli.build_request("GET", cached["url"], headers=headers)
-        upstream = await cli.send(req, stream=True)
-        out_headers = {"Content-Type": "audio/mpeg", "Accept-Ranges": "bytes", "Access-Control-Allow-Origin": "*"}
-        for h in ("Content-Length", "Content-Range"):
-            if h in upstream.headers: out_headers[h] = upstream.headers[h]
-        if request.method == "HEAD":
-            await upstream.aclose()
-            return Response(status_code=200, headers=out_headers)
-        async def gen_direct():
-            try:
-                async for chunk in upstream.aiter_raw(65536): yield chunk
-            finally: await upstream.aclose()
-        return StreamingResponse(gen_direct(), status_code=200, headers=out_headers)
-
+        return await _proxy_audio_url(cached["url"], request, "audio/mpeg")
     if cached["type"] == "hls":
-        headers = {"Content-Type": "audio/mp4", "Accept-Ranges": "bytes", "Access-Control-Allow-Origin": "*"}
+        if request.method == "HEAD":
+            return Response(status_code=200, headers={
+                "Content-Type": "audio/mp4", "Accept-Ranges": "none",
+                "Access-Control-Allow-Origin": "*",
+            })
+        cli = get_http()
         async def gen_hls():
             try:
-                if cached["init"]:
-                    ri = await cli.get(urljoin(cached["loc"], cached["init"]))
-                    if ri.status_code == 200: yield ri.content
-                for s in cached["segs"]:
-                    rs = await cli.get(urljoin(cached["loc"], s))
-                    if rs.status_code == 200: yield rs.content
-            except Exception: pass
-        return StreamingResponse(gen_hls(), status_code=200, headers=headers)
-
-    raise HTTPException(status_code=500, detail="Stream error")
+                if cached.get("init"):
+                    init_resp = await cli.get(urljoin(cached["loc"], cached["init"]))
+                    init_resp.raise_for_status()
+                    yield init_resp.content
+                for segment in cached.get("segs", []):
+                    segment_resp = await cli.get(urljoin(cached["loc"], segment))
+                    segment_resp.raise_for_status()
+                    yield segment_resp.content
+            except httpx.HTTPError as e:
+                print(f"[SOUNDCLOUD HLS STREAM ERROR] {e}")
+                raise
+        return StreamingResponse(gen_hls(), status_code=200, headers={
+            "Content-Type": "audio/mp4", "Accept-Ranges": "none",
+            "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store",
+        })
+    raise HTTPException(status_code=500, detail="Unsupported SoundCloud stream type")
 
 _ym_client = None
 def get_ym():
@@ -707,20 +745,7 @@ async def get_track_cover(title: str = Query(...), artist: str = Query("")):
 
 @app.api_route("/api/stream/{token}", methods=["GET", "HEAD", "OPTIONS"])
 async def stream(token: str, request: Request):
-    url = unsign(token); headers = {"Range": request.headers["range"]} if request.headers.get("range") else {}
-    try:
-        req = get_http().build_request("GET", url, headers=headers); upstream = await get_http().send(req, stream=True)
-    except Exception as e: raise HTTPException(status_code=502, detail=f"Proxy error: {e}")
-    out_headers = {"Content-Type": upstream.headers.get("content-type", "audio/mpeg"), "Accept-Ranges": "bytes", "Access-Control-Allow-Origin": "*"}
-    for h in ("Content-Length", "Content-Range"):
-        if h in upstream.headers: out_headers[h] = upstream.headers[h]
-    if upstream.status_code >= 400: await upstream.aclose(); raise HTTPException(status_code=502, detail="Upstream error")
-    if request.method == "HEAD": await upstream.aclose(); return Response(status_code=upstream.status_code, headers=out_headers)
-    async def gen():
-        try:
-            async for chunk in upstream.aiter_raw(65536): yield chunk
-        finally: await upstream.aclose()
-    return StreamingResponse(gen(), status_code=upstream.status_code, headers=out_headers)
+    return await _proxy_audio_url(unsign(token), request, "audio/mpeg")
 
 @app.api_route("/api/audio/{ym_id}", methods=["GET", "HEAD", "OPTIONS"])
 async def yandex_audio(ym_id: str, request: Request):
@@ -729,20 +754,11 @@ async def yandex_audio(ym_id: str, request: Request):
         try:
             link = await asyncio.to_thread(_ym_resolve_link, ym_id)
         except Exception as e:
-            raise HTTPException(status_code=502, detail=str(e))
-        if not link: raise HTTPException(status_code=502, detail="No download info")
+            raise HTTPException(status_code=502, detail=f"Yandex link resolve failed: {e}")
+        if not link:
+            raise HTTPException(status_code=404, detail="Yandex audio link is unavailable")
         _cache_put(_ym_link_cache, ym_id, link)
-    headers = {"Range": request.headers["range"]} if request.headers.get("range") else {}
-    req = get_http().build_request("GET", link, headers=headers); upstream = await get_http().send(req, stream=True)
-    out_headers = {"Content-Type": "audio/mpeg", "Accept-Ranges": "bytes", "Access-Control-Allow-Origin": "*"}
-    for h in ("Content-Length", "Content-Range"):
-        if h in upstream.headers: out_headers[h] = upstream.headers[h]
-    if request.method == "HEAD": await upstream.aclose(); return Response(status_code=upstream.status_code, headers=out_headers)
-    async def gen():
-        try:
-            async for chunk in upstream.aiter_raw(65536): yield chunk
-        finally: await upstream.aclose()
-    return StreamingResponse(gen(), status_code=upstream.status_code, headers=out_headers)
+    return await _proxy_audio_url(link, request, "audio/mpeg")
 
 @app.api_route("/api/cover/{token}", methods=["GET", "OPTIONS"])
 async def cover(token: str):
