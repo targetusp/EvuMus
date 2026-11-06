@@ -560,6 +560,17 @@ function userFromInitData(initData) {
 }
 
 
+async function isRequiredChannelMember(userId) {
+  const result = await bot.api.getChatMember('@EvuMusic', Number(userId));
+  return (
+    result.status === 'creator' ||
+    result.status === 'administrator' ||
+    result.status === 'member' ||
+    (result.status === 'restricted' && result.is_member === true)
+  );
+}
+
+
 /* ================= NODE API ================= */
 
 // Поиск по локальной базе канала
@@ -624,6 +635,24 @@ app.post('/api/send', express.json(), async (req, res) => {
     if (!user || !validInitData(initData)) {
       return res.status(401).json({
         error: 'auth'
+      });
+    }
+
+    let subscribed = false;
+    try {
+      subscribed = await isRequiredChannelMember(user.id);
+    } catch (membershipError) {
+      console.error('Subscription check error:', membershipError);
+      return res.status(503).json({
+        error: 'subscription_check_unavailable',
+        message: 'Не удалось проверить подписку на @EvuMusic'
+      });
+    }
+
+    if (!subscribed) {
+      return res.status(403).json({
+        error: 'subscription_required',
+        message: 'Подпишись на @EvuMusic'
       });
     }
 
