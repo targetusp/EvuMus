@@ -8,7 +8,54 @@
   <link rel="stylesheet" href="style.css">
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
 </head>
-<body>
+<body class="subscription-locked">
+  <style>
+    body.subscription-locked .app,
+    body.subscription-locked .tg-header { visibility: hidden !important; }
+    #subscriptionGate {
+      position: fixed; inset: 0; z-index: 999999;
+      display: flex; align-items: center; justify-content: center;
+      padding: 24px; box-sizing: border-box;
+      background: radial-gradient(ellipse at 50% 0%, #18395b 0%, #0b1622 58%, #070e16 100%);
+      color: #f4f8fc; font-family: Arial, sans-serif;
+    }
+    #subscriptionGate[hidden] { display: none !important; }
+    .subscription-card {
+      width: 100%; max-width: 390px; box-sizing: border-box;
+      padding: 30px 24px; border: 1px solid rgba(83,166,255,.28);
+      border-radius: 24px; background: rgba(17,31,46,.96);
+      box-shadow: 0 24px 80px rgba(0,0,0,.38); text-align: center;
+    }
+    .subscription-logo {
+      width: 62px; height: 62px; margin: 0 auto 18px;
+      display: grid; place-items: center; border-radius: 20px;
+      color: #081522; font-size: 27px; font-weight: 900;
+      background: linear-gradient(135deg,#dff5ff,#55baff);
+      box-shadow: 0 8px 28px rgba(67,171,255,.22);
+    }
+    .subscription-card h1 { margin: 0 0 10px; font-size: 25px; }
+    .subscription-card p { margin: 0 0 22px; color: #a9bbcd; line-height: 1.5; font-size: 14px; }
+    .subscription-action {
+      display: flex; width: 100%; min-height: 48px; box-sizing: border-box;
+      align-items: center; justify-content: center; border: 0; border-radius: 14px;
+      text-decoration: none; font-size: 15px; font-weight: 700; cursor: pointer;
+    }
+    .subscription-join { color: #071522; background: linear-gradient(110deg,#dff5ff,#73c5ff); }
+    .subscription-check { margin-top: 10px; color: #eaf4ff; background: #263b50; }
+    .subscription-check:disabled { opacity: .6; cursor: wait; }
+    #subscriptionStatus { min-height: 18px; margin: 16px 0 0; color: #91a8bd; font-size: 12px; }
+  </style>
+
+  <section id="subscriptionGate" role="dialog" aria-modal="true" aria-labelledby="subscriptionTitle">
+    <div class="subscription-card">
+      <div class="subscription-logo">E</div>
+      <h1 id="subscriptionTitle">Подпишись на EvuMusic</h1>
+      <p>Чтобы пользоваться плеером, подпишись на наш Telegram-канал. После подписки нажми кнопку проверки.</p>
+      <a class="subscription-action subscription-join" href="https://t.me/EvuMusic" target="_blank" rel="noopener noreferrer">Подписаться на канал ↗</a>
+      <button class="subscription-action subscription-check" id="checkSubscriptionBtn" type="button">Проверить подписку</button>
+      <div id="subscriptionStatus" aria-live="polite">Проверяем подписку…</div>
+    </div>
+  </section>
 
   <header class="tg-header" id="tgHeader">
     <button class="tg-header__btn" aria-label="Назад">
