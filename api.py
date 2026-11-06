@@ -50,6 +50,18 @@ _album_cache = {}
 _album_search_cache = {}
 _sc_resolve_cache = {}
 _sc_resolve_inflight = {}
+_SC_RESOLVE_TTL = 300  # SoundCloud CDN URLs may expire; refresh at least every 5 minutes.
+
+def _sc_cache_get(sc_id):
+    key = str(sc_id)
+    entry = _sc_resolve_cache.get(key)
+    if not entry:
+        return None
+    cached_at = float(entry.get("_cached_at", 0) or 0)
+    if not cached_at or time.time() - cached_at > _SC_RESOLVE_TTL:
+        _sc_resolve_cache.pop(key, None)
+        return None
+    return entry
 _ym_link_cache = {}
 
 _CACHE_TTL = 900        # 15 минут
@@ -449,7 +461,7 @@ async def audius_search(query: str, limit: int) -> list:
 async def _prewarm_sc_impl(sc_id):
     """Resolve SoundCloud to a browser-playable stream, retrying transient API failures."""
     sc_id = str(sc_id)
-    if sc_id in _sc_resolve_cache:
+    if _sc_cache_get(sc_id):
         return
 
     cli = get_http()
@@ -522,6 +534,7 @@ async def _prewarm_sc_impl(sc_id):
                             "type": "direct",
                             "url": direct_url,
                             "mime": mime or "audio/mpeg",
+                            "_cached_at": time.time(),
                         }
                         return
                 if resolved.status_code not in (408, 425, 429) and resolved.status_code < 500:
@@ -557,7 +570,7 @@ async def _prewarm_sc_impl(sc_id):
                 )
                 manifest.raise_for_status()
                 if manifest.text.lstrip("\\ufeff\\n\\r ").startswith("#EXTM3U"):
-                    _sc_resolve_cache[sc_id] = {"type": "hls", "url": str(manifest.url)}
+                    _sc_resolve_cache[sc_id] = {"type": "hls", "url": str(manifest.url), "_cached_at": time.time()}
                     return
                 print(f"[SOUNDCLOUD RESOLVE] {sc_id}: HLS response is not a playlist")
                 break
@@ -571,7 +584,7 @@ async def _prewarm_sc_impl(sc_id):
 async def prewarm_sc(sc_id):
     """Coalesce simultaneous requests so background warm-up and Play share one resolve."""
     sc_id = str(sc_id)
-    if sc_id in _sc_resolve_cache:
+    if _sc_cache_get(sc_id):
         return
     task = _sc_resolve_inflight.get(sc_id)
     if task is None:
@@ -672,9 +685,9 @@ async def soundcloud_audio(sc_id: str, request: Request):
             "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
             "Access-Control-Allow-Headers": "Range, Content-Type",
         })
-    if sc_id not in _sc_resolve_cache:
+    if not _sc_cache_get(sc_id):
         await prewarm_sc(sc_id)
-    cached = _sc_resolve_cache.get(sc_id)
+    cached = _sc_cache_get(sc_id)
     if not cached:
         raise HTTPException(status_code=415, detail="SoundCloud did not provide a browser-compatible audio stream")
     if cached["type"] == "direct":
@@ -694,9 +707,9 @@ async def soundcloud_resolve(sc_id: str, refresh: bool = False):
             try: await old_task
             except Exception: pass
         _sc_resolve_cache.pop(str(sc_id), None)
-    if sc_id not in _sc_resolve_cache:
+    if not _sc_cache_get(sc_id):
         await prewarm_sc(sc_id)
-    cached = _sc_resolve_cache.get(sc_id)
+    cached = _sc_cache_get(sc_id)
     if not cached:
         raise HTTPException(status_code=415, detail="No compatible SoundCloud stream")
     if cached["type"] == "direct":
@@ -943,7 +956,7 @@ async def _track_is_playable(track: dict) -> bool:
                     if not ext_id:
                         return False
                     await prewarm_sc(ext_id)
-                    resolved = _sc_resolve_cache.get(ext_id)
+                    resolved = _sc_cache_get(ext_id)
                     if not resolved:
                         return False
                     if resolved.get('type') == 'hls':
@@ -1032,7 +1045,7 @@ async def _packed_track_is_playable(track: dict) -> bool:
     ext_id = str(track.get('ext_id') or track.get('ym_id') or '')
     if source == 'soundcloud':
         await prewarm_sc(ext_id)
-        resolved = _sc_resolve_cache.get(ext_id)
+        resolved = _sc_cache_get(ext_id)
         if not resolved:
             return False
         if resolved.get('type') == 'hls':
@@ -1232,7 +1245,7 @@ async def resolve_full_track(title: str = Query(...), artist: str = Query(""), d
         if cached.get('source') == 'soundcloud':
             source_id = str(cached.get('ext_id') or '')
             await prewarm_sc(source_id)
-            resolved = _sc_resolve_cache.get(source_id)
+            resolved = _sc_cache_get(source_id)
             if resolved and (await (_probe_hls_url(resolved.get('url', '')) if resolved.get('type') == 'hls' else _probe_audio_url(resolved.get('url', '')))):
                 return cached
         elif cached.get('source') == 'yandex':
