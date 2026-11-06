@@ -1010,11 +1010,19 @@
 
     audio.onplaying = function () { if (previewAudio === audio) setPlayingUI(true); };
     audio.onwaiting = function () { if (previewAudio === audio) setPlayingUI(false); };
+    // HLS.js controls the MediaSource pipeline. Browsers can emit a transient
+    // media-element error while hls.js is still loading/recovering the manifest
+    // or first segment. Do not show a false error or start a competing retry.
+    var hlsJsOwnsMedia = false;
     audio.onerror = function () {
       if (previewAudio !== audio) return;
+      if (hlsJsOwnsMedia) {
+        console.warn('[EvuMusic] transient media-element error while hls.js is active; waiting for HLS recovery');
+        return;
+      }
       setPlayingUI(false);
       var err = audio.error;
-      console.error('[EvuMusic] HLS media element error:', err && { code: err.code, message: err.message, src: audio.currentSrc });
+      console.error('[EvuMusic] native HLS media element error:', err && { code: err.code, message: err.message, src: audio.currentSrc });
       if (retrySoundCloudPlayback(t, retryCount, 'native HLS media error')) return;
       toast(err && err.code === 4 ? 'Браузер не поддерживает кодек этого HLS-потока' : 'Не удалось загрузить HLS-поток');
     };
@@ -1046,6 +1054,7 @@
         return;
       }
 
+      hlsJsOwnsMedia = true;
       var recoveredMedia = false;
       var recoveredNetwork = false;
       var hls = new Hls({
@@ -1066,8 +1075,12 @@
       activeHls = hls;
 
       hls.on(Hls.Events.ERROR, function (_event, data) {
-        console.error('[EvuMusic] HLS error:', data);
-        if (!data || !data.fatal || previewAudio !== audio) return;
+        if (!data || previewAudio !== audio) return;
+        if (!data.fatal) {
+          console.warn('[EvuMusic] recoverable HLS event:', data.details || data.type || data);
+          return;
+        }
+        console.error('[EvuMusic] fatal HLS error:', data);
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR && !recoveredNetwork) {
           recoveredNetwork = true;
           try { hls.startLoad(); return; } catch (e) { console.error('[EvuMusic] HLS network recovery failed:', e); }
