@@ -1300,6 +1300,96 @@
   var muteBtn = $('#playerMute'); if (muteBtn) muteBtn.addEventListener('click', function () { if (volume > 0) { lastVolume = volume; volume = 0; } else { volume = lastVolume || 100; } applyVolume(volume); });
   var closeBtn = $('#playerClose'); if (closeBtn) closeBtn.addEventListener('click', function () { stopPreview(); playerState.playing = false; var pc = $('#playerContainer'); if(pc) pc.hidden = true; var pl = $('#player'); if(pl) pl.hidden = true; var pr = $('#playerProgress'); if(pr) pr.style.width = '0%'; });
 
-  // ===== Init =====
-  renderPlaylists(); renderAlbums(); loadUserData();
+  // ===== Обязательная проверка подписки на Telegram-канал =====
+  var subscriptionGate = document.getElementById('subscriptionGate');
+  var subscriptionStatus = document.getElementById('subscriptionStatus');
+  var subscriptionButton = document.getElementById('checkSubscriptionBtn');
+  var appInitialized = false;
+  var subscriptionCheckInProgress = false;
+
+  function setSubscriptionMessage(message) {
+    if (subscriptionStatus) subscriptionStatus.textContent = message;
+  }
+
+  function lockForSubscription(message) {
+    document.body.classList.add('subscription-locked');
+    if (subscriptionGate) subscriptionGate.hidden = false;
+    if (message) setSubscriptionMessage(message);
+    if (appInitialized) {
+      try { stopPreview(); } catch (e) {}
+      try { setPlayingUI(false); } catch (e) {}
+    }
+  }
+
+  async function checkSubscription() {
+    if (subscriptionCheckInProgress) return false;
+    subscriptionCheckInProgress = true;
+
+    if (subscriptionButton) {
+      subscriptionButton.disabled = true;
+      subscriptionButton.textContent = 'Проверяем…';
+    }
+    setSubscriptionMessage('Проверяем подписку на @EvuMusic…');
+
+    try {
+      if (!TG || !TG.initData) {
+        lockForSubscription('Открой EvuMusic через Telegram, чтобы подтвердить подписку.');
+        return false;
+      }
+
+      var response = await fetch(API_URL + '/api/check-subscription', {
+        method: 'GET',
+        headers: getAuthHeader(),
+        cache: 'no-store'
+      });
+      var result = await response.json().catch(function () { return {}; });
+
+      if (response.ok && result.subscribed === true) {
+        if (subscriptionGate) subscriptionGate.hidden = true;
+        document.body.classList.remove('subscription-locked');
+
+        if (!appInitialized) {
+          appInitialized = true;
+          renderPlaylists();
+          renderAlbums();
+          loadUserData();
+        }
+        return true;
+      }
+
+      if (response.status === 403 || result.subscribed === false) {
+        lockForSubscription('Подписка не найдена. Подпишись на канал и нажми «Проверить подписку».');
+      } else {
+        lockForSubscription('Не удалось проверить подписку. Проверь подключение и попробуй ещё раз.');
+      }
+      return false;
+
+    } catch (error) {
+      console.error('[EvuMusic] subscription check failed:', error);
+      lockForSubscription('Не удалось связаться с сервером. Попробуй проверить подписку ещё раз.');
+      return false;
+
+    } finally {
+      subscriptionCheckInProgress = false;
+      if (subscriptionButton) {
+        subscriptionButton.disabled = false;
+        subscriptionButton.textContent = 'Проверить подписку';
+      }
+    }
+  }
+
+  if (subscriptionButton) {
+    subscriptionButton.addEventListener('click', function () {
+      checkSubscription();
+    });
+  }
+
+  // Проверка при каждом открытии, а также периодически пока Mini App открыто.
+  checkSubscription();
+  window.setInterval(function () {
+    if (document.visibilityState === 'visible') checkSubscription();
+  }, 60000);
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible' && appInitialized) checkSubscription();
+  });
 })();
