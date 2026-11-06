@@ -25,6 +25,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+REQUIRED_CHANNEL = "@EvuMusic"
+_subscription_cache = {}
+_SUBSCRIPTION_CACHE_TTL = 10  # короткий кеш, чтобы не дергать Telegram на каждый запрос
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 ENABLE_MUZOFOND = os.getenv("MUZOFOND", "1") == "1"
 ENABLE_YANDEX = os.getenv("YANDEX", "1") == "1"
@@ -168,9 +171,70 @@ def verify_telegram_data(init_data: str) -> dict:
     except Exception:
         raise HTTPException(status_code=403, detail="Invalid auth")
 
+async def is_channel_subscribed(user_id: int, force: bool = False) -> bool:
+    """Проверяет актуальную подписку пользователя на обязательный Telegram-канал."""
+    now = time.time()
+    cached = _subscription_cache.get(int(user_id))
+    if not force and cached and now - cached[0] < _SUBSCRIPTION_CACHE_TTL:
+        return bool(cached[1])
+
+    if not BOT_TOKEN:
+        raise HTTPException(status_code=503, detail="subscription_check_unavailable")
+
+    try:
+        response = await get_http().get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/getChatMember",
+            params={"chat_id": REQUIRED_CHANNEL, "user_id": int(user_id)},
+            timeout=8.0,
+        )
+        payload = response.json()
+        if response.status_code != 200 or not payload.get("ok"):
+            # Не открываем доступ, если Telegram не смог подтвердить статус.
+            print("[SUBSCRIPTION] Telegram getChatMember error:", payload)
+            raise HTTPException(status_code=503, detail="subscription_check_unavailable")
+
+        member = payload.get("result") or {}
+        status = member.get("status")
+        subscribed = (
+            status in ("creator", "administrator", "member")
+            or (status == "restricted" and member.get("is_member") is True)
+        )
+        _subscription_cache[int(user_id)] = (now, subscribed)
+        return subscribed
+
+    except HTTPException:
+        raise
+    except Exception as error:
+        print("[SUBSCRIPTION] Check failed:", error)
+        raise HTTPException(status_code=503, detail="subscription_check_unavailable")
+
+
+@app.get("/api/check-subscription")
+async def check_subscription(authorization: Optional[str] = Header(None)):
+    # Этот endpoint вызывается при каждом открытии Mini App и всегда проверяет Telegram заново.
+    user = verify_telegram_data(authorization)
+    try:
+        user_id = int(user.get("id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid Telegram user")
+
+    subscribed = await is_channel_subscribed(user_id, force=True)
+    return {
+        "subscribed": subscribed,
+        "channel": REQUIRED_CHANNEL,
+    }
+
+
 async def get_user_id(authorization: Optional[str] = Header(None)):
     user = verify_telegram_data(authorization)
-    return int(user.get("id"))
+    try:
+        user_id = int(user.get("id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid Telegram user")
+
+    if not await is_channel_subscribed(user_id):
+        raise HTTPException(status_code=403, detail="subscription_required")
+    return user_id
 
 # ==========================================
 # БАЗА ДАННЫХ
