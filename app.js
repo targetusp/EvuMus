@@ -64,34 +64,34 @@
     return parseInt(durStr, 10) || 0;
   }
 
-  // Единый прогресс для обычного аудио и HLS.
-  function trackDurationSeconds(track) {
-    if (!track) return 0;
-    var raw = Number(track.duration);
-    // В API duration обычно приходит в секундах, но некоторые источники дают ms.
-    if (Number.isFinite(raw) && raw > 0) return raw > 100000 ? raw / 1000 : raw;
-    return parseDuration(String(track.dur || '')) || 0;
+  // Один источник правды для полоски прогресса: работает с обычным аудио,
+  // native HLS и HLS.js. В metadata duration иногда временно равен NaN/Infinity.
+  var seekDrag = false;
+  function playerDuration(audio, track) {
+    var actual = Number(audio && audio.duration);
+    if (Number.isFinite(actual) && actual > 0) return actual;
+    var fromTrack = parseDuration(track && (track.dur || track.duration));
+    return Number.isFinite(fromTrack) && fromTrack > 0 ? fromTrack : 0;
   }
-
-  function updateAudioProgress(audio, track) {
-    if (!audio || previewAudio !== audio || seekDrag) return;
-    var duration = Number(audio.duration);
-    if (!Number.isFinite(duration) || duration <= 0) duration = trackDurationSeconds(track);
-    if (!Number.isFinite(duration) || duration <= 0) return;
-
-    var current = Number(audio.currentTime);
-    if (!Number.isFinite(current) || current < 0) current = 0;
-    var percent = Math.max(0, Math.min(100, current / duration * 100));
-    var progress = $('#playerProgress');
-    if (progress) progress.style.width = percent + '%';
+  function updatePlayerProgress(audio, track, force) {
+    if (!audio || previewAudio !== audio || (seekDrag && !force)) return;
+    var bar = $('#playerProgress');
+    if (!bar) return;
+    var duration = playerDuration(audio, track);
+    var current = Number(audio.currentTime) || 0;
+    var percent = duration > 0 ? Math.max(0, Math.min(100, current / duration * 100)) : 0;
+    bar.style.width = percent + '%';
+    bar.style.setProperty('--player-progress', percent + '%');
+    bar.setAttribute('aria-valuenow', String(Math.round(percent)));
   }
-
-  function bindAudioProgress(audio, track) {
-    ['timeupdate', 'durationchange', 'loadedmetadata', 'loadeddata',
-     'progress', 'playing', 'seeked'].forEach(function (eventName) {
-      audio.addEventListener(eventName, function () {
-        updateAudioProgress(audio, track);
-      });
+  function bindPlayerProgress(audio, track) {
+    ['timeupdate', 'durationchange', 'loadedmetadata', 'loadeddata', 'playing', 'seeked', 'progress'].forEach(function (name) {
+      audio.addEventListener(name, function () { updatePlayerProgress(audio, track); });
+    });
+    audio.addEventListener('ended', function () {
+      if (previewAudio !== audio) return;
+      var bar = $('#playerProgress');
+      if (bar) { bar.style.width = '0%'; bar.style.setProperty('--player-progress', '0%'); }
     });
   }
 
@@ -147,19 +147,21 @@
     } catch (e) { toast('Ошибка'); }
   }
 
-  // ОТПРАВКА В ЧАТ (МГНОВЕННАЯ)
-  function apiSendToChat(tr, btn) {
+  // Отправка трека как загруженного аудиофайла через альтернативный источник.
+  async function apiSendToChat(tr, btn) {
     try {
-        // Отправляем запрос, но не ждем ответа
-        fetch(API_URL + '/api/send_to_chat', {
-            method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, getAuthHeader()),
-            body: JSON.stringify({ id: String(tr.id), title: tr.title, artist: tr.artist, duration: tr.dur || '', cover: tr.cover || '', source: tr.source || '', preview: tr.preview || '' })
-        }).catch(function(){});
-        
-        // Сразу показываем уведомление
-        toast('Отправляю трек в чат...');
-    } catch (e) { 
-        toast('Не удалось'); 
+      toast('Ищу аудиоверсию и отправляю в чат…');
+      var response = await fetch(API_URL + '/api/send_to_chat', {
+        method: 'POST',
+        headers: Object.assign({ 'Content-Type': 'application/json' }, getAuthHeader()),
+        body: JSON.stringify({ id: String(tr.id), title: tr.title, artist: tr.artist, duration: tr.dur || '', cover: tr.cover || '', source: tr.source || '', preview: tr.preview || '' })
+      });
+      var data = await response.json().catch(function () { return {}; });
+      if (!response.ok) throw new Error(data.detail || data.error || 'send failed');
+      toast('Ищу версию не из SoundCloud. Результат придёт в чат с ботом');
+    } catch (e) {
+      console.error('[EvuMusic] send to chat failed:', e);
+      toast('Не удалось отправить трек. Попробуй позже');
     }
   }
 
@@ -948,8 +950,6 @@
     audio.src = absoluteUrl;
     try { audio.load(); audio.currentTime = 0; } catch (e) {}
     showPlayer(t);
-    var initialProgress = $('#playerProgress');
-    if (initialProgress) initialProgress.style.width = '0%';
     setPlayingUI(false);
     var activeRow = $$('.track').find(function (row) { return row.getAttribute('data-id') === previewTrackId; });
     if (activeRow) {
@@ -979,7 +979,7 @@
       };
       toast(messages[code] || 'Не удалось загрузить трек');
     };
-    bindAudioProgress(audio, t);
+    bindPlayerProgress(audio, t);
     audio.onended = function () {
       if (previewAudio !== audio) return;
       var progress = $('#playerProgress');
@@ -1032,13 +1032,21 @@
     audio.setAttribute('playsinline', '');
     audio.setAttribute('webkit-playsinline', '');
     audio.volume = volume / 100;
-    bindAudioProgress(audio, t);
     showPlayer(t);
-    var initialProgress = $('#playerProgress');
-    if (initialProgress) initialProgress.style.width = '0%';
     setPlayingUI(false);
+    bindPlayerProgress(audio, t);
+    audio.onended = function () {
+      if (previewAudio !== audio) return;
+      var bar = $('#playerProgress'); if (bar) bar.style.width = '0%';
+      var idx = queueIds.indexOf(previewTrackId);
+      if (idx >= 0 && idx < queueIds.length - 1) {
+        var nextTrack = trackRegistry[queueIds[idx + 1]] || findTrack(queueIds[idx + 1]);
+        if (nextTrack && nextTrack.preview) { playPreview(nextTrack); return; }
+      }
+      setPlayingUI(false);
+    };
 
-    audio.onplaying = function () { if (previewAudio === audio) setPlayingUI(true); };
+    audio.onplaying = function () { if (previewAudio === audio) { setPlayingUI(true); updatePlayerProgress(audio, t, true); } };
     audio.onwaiting = function () { if (previewAudio === audio) setPlayingUI(false); };
     // HLS.js controls the MediaSource pipeline. Browsers can emit a transient
     // media-element error while hls.js is still loading/recovering the manifest
@@ -1298,7 +1306,7 @@
   var pPrev = $('#playerPrev'); if (pPrev) pPrev.addEventListener('click', function () { if (!previewAudio || !previewTrackId) return; var q = queueTracks(); var idx = q.findIndex(function (t) { return String(t.id) === String(previewTrackId); }); if (idx > 0) { playPreview(q[idx - 1]); return; } try { previewAudio.currentTime = 0; } catch (e) {} if (previewAudio.paused) { previewAudio.play().catch(function () {}); } var p = $('#playerProgress'); if(p) p.style.width = '0%'; setPlayingUI(true); });
   var pNext = $('#playerNext'); if (pNext) pNext.addEventListener('click', function () { if (!previewTrackId) return; var q = queueTracks(); var idx = q.findIndex(function (t) { return String(t.id) === String(previewTrackId); }); if (idx >= 0 && idx < q.length - 1) { playPreview(q[idx + 1]); } else if (q.length) { playPreview(q[0]); } });
 
-  var seekDrag = false; var seekEl = $('#playerSeek');
+  var seekEl = $('#playerSeek');
   function seekByPoint(clientX) { 
     if (!seekEl) return; 
     var r = seekEl.getBoundingClientRect(); if (!r.width) return; 
@@ -1306,11 +1314,9 @@
     var pr = $('#playerProgress'); if(pr) pr.style.width = (p * 100) + '%'; 
     if (previewAudio) {
         var tr = findTrack(previewTrackId);
-        var dur = Number(previewAudio.duration);
-        if (!Number.isFinite(dur) || dur <= 0) dur = trackDurationSeconds(tr);
-        if (Number.isFinite(dur) && dur > 0) {
-          try { previewAudio.currentTime = p * dur; }
-          catch (e) { console.warn('[EvuMusic] seek is not available for this stream:', e); }
+        var dur = playerDuration(previewAudio, tr);
+        if (dur > 0) {
+          try { previewAudio.currentTime = p * dur; } catch (e) { console.warn('[EvuMusic] seek failed:', e); }
         }
     }
   }
