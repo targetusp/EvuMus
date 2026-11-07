@@ -535,6 +535,12 @@ async def stream(token: str, request: Request):
 async def soundcloud_audio(sc_id: str, request: Request):
     if not ENABLE_SOUNDCLOUD:
         raise HTTPException(status_code=503, detail="SoundCloud disabled")
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "Range, Content-Type",
+        })
 
     try:
         data = await soundcloud_stream_bytes(sc_id)
@@ -542,36 +548,47 @@ async def soundcloud_audio(sc_id: str, request: Request):
         raise
     except Exception as e:
         print("[SC stream error]", type(e).__name__, e)
-        raise HTTPException(status_code=502, detail=f"SoundCloud stream error: {e}")
+        raise HTTPException(status_code=502, detail="SoundCloud stream is temporarily unavailable")
 
+    total = len(data)
     headers = {
         "Content-Type": "audio/mp4",
         "Accept-Ranges": "bytes",
         "Access-Control-Allow-Origin": "*",
-        "Cache-Control": "public, max-age=3600",
-        "Content-Length": str(len(data)),
+        "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
+        "Cache-Control": "no-store",
+        "Content-Length": str(total),
     }
-    if request.method in ("HEAD", "OPTIONS"):
+    if request.method == "HEAD":
         return Response(status_code=200, headers=headers)
 
     rng = request.headers.get("range")
     if rng and rng.startswith("bytes="):
         try:
-            a_s, b_s = rng[6:].split("-", 1)
-            a = int(a_s) if a_s else 0
-            b = int(b_s) if b_s else len(data) - 1
-            b = min(b, len(data) - 1)
-            if a > b or a >= len(data):
-                return Response(
-                    status_code=416,
-                    headers={"Content-Range": f"bytes */{len(data)}"},
-                )
-            part = data[a:b + 1]
-            h = dict(headers)
-            h["Content-Range"] = f"bytes {a}-{b}/{len(data)}"
-            h["Content-Length"] = str(len(part))
-            return Response(content=part, status_code=206, headers=h)
-        except ValueError:
+            range_value = rng[6:].split(",", 1)[0].strip()
+            start_s, end_s = range_value.split("-", 1)
+            if not start_s:
+                suffix = int(end_s)
+                if suffix <= 0:
+                    raise ValueError("invalid suffix range")
+                start = max(0, total - suffix)
+                end = total - 1
+            else:
+                start = int(start_s)
+                end = int(end_s) if end_s else total - 1
+            end = min(end, total - 1)
+            if start < 0 or start >= total or end < start:
+                return Response(status_code=416, headers={
+                    "Content-Range": f"bytes */{total}",
+                    "Accept-Ranges": "bytes",
+                    "Access-Control-Allow-Origin": "*",
+                })
+            part = data[start:end + 1]
+            range_headers = dict(headers)
+            range_headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+            range_headers["Content-Length"] = str(len(part))
+            return Response(content=part, status_code=206, headers=range_headers)
+        except (ValueError, TypeError):
             pass
 
     return Response(content=data, status_code=200, headers=headers)
