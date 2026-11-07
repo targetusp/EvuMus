@@ -307,42 +307,152 @@ async def add_track_to_playlist(data: PlaylistTrackData, user_id: int = Depends(
     return {"status": "ok"}
 
 # ==========================================
-# ОТПРАВКА В ЧАТ (В ФОНЕ)
+# ОТПРАВКА В ЧАТ: ИЩЕМ НЕ-SOUNDCLOUD И ЗАГРУЖАЕМ ФАЙЛ В TELEGRAM
 # ==========================================
-async def send_audio_task(user_id: int, track: TrackData, audio_url: str):
-    tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendAudio"
-    watermark = "\n\n🤖 Скачано через: @EvuMusicBot"
-    caption_text = f"🎵 {track.title} — {track.artist}{watermark}"
-    
-    payload = {
-        "chat_id": user_id, 
-        "audio": audio_url, 
-        "title": track.title, 
-        "performer": track.artist, 
-        "caption": caption_text
-    }
-    
+def _duration_seconds(value: str) -> int:
+    value = str(value or '').strip()
+    if not value:
+        return 0
+    if ':' in value:
+        parts = value.split(':')
+        try:
+            return int(parts[-2]) * 60 + int(parts[-1])
+        except (ValueError, IndexError):
+            return 0
     try:
-        async with httpx.AsyncClient() as client:
-            # Таймаут увеличен, так как файл может скачиваться долго
-            res = await client.post(tg_url, json=payload, timeout=60.0)
-            if res.status_code != 200:
-                fallback_text = f"🎵 {track.title}\n{audio_url}{watermark}"
-                await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id": user_id, "text": fallback_text})
-    except Exception as e:
-        print(f"[SEND ERROR] {e}")
+        return int(float(value))
+    except ValueError:
+        return 0
 
-@app.post("/api/send_to_chat")
+
+async def _find_non_soundcloud_audio(track: TrackData) -> dict:
+    # Find the same full track via Yandex, Muzofond or Audius; SoundCloud is never used here.
+    title = norm(track.title)
+    artist = norm(track.artist)
+    if not title:
+        raise HTTPException(status_code=400, detail='Track title is required')
+    query = (artist + ' ' + title).strip()
+    tasks = []
+    if ENABLE_YANDEX:
+        tasks.append(asyncio.create_task(yandex_search(query, 20)))
+    if ENABLE_MUZOFOND:
+        tasks.append(asyncio.create_task(muzofond_search(query, 20)))
+    if ENABLE_AUDIUS:
+        tasks.append(asyncio.create_task(audius_search(query, 20)))
+    if not tasks:
+        raise HTTPException(status_code=503, detail='No non-SoundCloud audio providers are enabled')
+
+    groups = await asyncio.gather(*tasks, return_exceptions=True)
+    wanted_title = _match_text(title)
+    wanted_artist = _match_text(artist)
+    wanted_duration = _duration_seconds(track.duration)
+    candidates = []
+    for group in groups:
+        if isinstance(group, Exception) or not group:
+            continue
+        for item in group:
+            source = str(item.get('source') or '').lower()
+            if source == 'soundcloud' or item.get('full') is False:
+                continue
+            if source not in ('yandex', 'muzofond', 'audius'):
+                continue
+            score = _track_match_score(wanted_title, wanted_artist, wanted_duration, item)
+            if score is not None:
+                candidates.append((score, item))
+
+    candidates.sort(key=lambda pair: pair[0], reverse=True)
+    for _, item in candidates:
+        if await _track_is_playable(item):
+            return item
+    raise HTTPException(status_code=404, detail='No matching full audio found outside SoundCloud')
+
+
+async def _download_candidate_audio(item: dict) -> tuple[bytes, str, str]:
+    source = str(item.get('source') or '').lower()
+    if source == 'soundcloud':
+        raise HTTPException(status_code=400, detail='SoundCloud is not permitted for Telegram delivery')
+    if source == 'yandex':
+        ym_id = str(item.get('ym_id') or item.get('ext_id') or '')
+        direct_url = _cache_get(_ym_link_cache, ym_id)
+        if not direct_url:
+            direct_url = await asyncio.to_thread(_ym_resolve_link, ym_id)
+        if not direct_url:
+            raise HTTPException(status_code=502, detail='Yandex audio link unavailable')
+        _cache_put(_ym_link_cache, ym_id, direct_url)
+    elif source in ('muzofond', 'audius'):
+        direct_url = str(item.get('audio_url') or '')
+    else:
+        raise HTTPException(status_code=400, detail='Unsupported audio provider')
+    if not direct_url.startswith(('https://', 'http://')):
+        raise HTTPException(status_code=502, detail='Audio source did not return a valid stream')
+
+    data = bytearray()
+    async with get_http().stream('GET', direct_url, headers={'Accept': 'audio/*,*/*;q=0.8', 'Accept-Encoding': 'identity'}, timeout=httpx.Timeout(connect=12.0, read=90.0, write=20.0, pool=12.0), follow_redirects=True) as response:
+        if response.status_code != 200:
+            raise HTTPException(status_code=502, detail=f'Audio provider returned HTTP {response.status_code}')
+        content_type = (response.headers.get('content-type') or '').split(';')[0].lower()
+        if content_type in ('text/html', 'text/plain', 'application/json', 'application/xml'):
+            raise HTTPException(status_code=502, detail='Provider returned a web page instead of audio')
+        async for chunk in response.aiter_bytes(128 * 1024):
+            if not chunk:
+                continue
+            data.extend(chunk)
+            # Telegram Bot API sendAudio upload limit is 50 MB. Leave headroom.
+            if len(data) > 49 * 1024 * 1024:
+                raise HTTPException(status_code=413, detail='Audio file exceeds Telegram upload limit')
+    if len(data) < 1024:
+        raise HTTPException(status_code=502, detail='Audio file is empty or incomplete')
+    head = bytes(data[:512]).lstrip().lower()
+    if head.startswith((b'<!doctype html', b'<html', b'{"error"', b'{"message"')):
+        raise HTTPException(status_code=502, detail='Provider returned an error page instead of audio')
+    mime = content_type if content_type.startswith('audio/') else 'audio/mpeg'
+    ext = 'm4a' if mime in ('audio/mp4', 'audio/x-m4a') else 'mp3'
+    return bytes(data), mime, ext
+
+
+async def send_audio_task(user_id: int, track: TrackData):
+    if not BOT_TOKEN:
+        print('[SEND ERROR] BOT_TOKEN is missing')
+        return
+    try:
+        candidate = await _find_non_soundcloud_audio(track)
+        audio_bytes, mime, ext = await _download_candidate_audio(candidate)
+        tg_url = f'https://api.telegram.org/bot{BOT_TOKEN}/sendAudio'
+        caption = f'🎵 {track.title} — {track.artist}\n\n🤖 Скачано через: @EvuMusicBot'
+        safe_title = re.sub(r'[\\/:*?"<>|]+', '_', norm(track.title))[:100] or 'EvuMusic'
+        safe_artist = norm(track.artist)[:64]
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
+            response = await client.post(
+                tg_url,
+                data={'chat_id': str(user_id), 'title': safe_title, 'performer': safe_artist, 'caption': caption},
+                files={'audio': (f'{safe_title}.{ext}', audio_bytes, mime)},
+            )
+            payload = response.json() if response.headers.get('content-type', '').startswith('application/json') else {}
+            if response.status_code != 200 or not payload.get('ok'):
+                description = (payload.get('description') or response.text[:300] or 'Telegram upload failed')
+                raise RuntimeError(description)
+        print(f"[SEND OK] user={user_id} source={candidate.get('source')} bytes={len(audio_bytes)}")
+    except Exception as error:
+        print(f'[SEND ERROR] user={user_id}: {type(error).__name__}: {error}')
+        # Never fall back to a URL: no server address or provider link is sent to the chat.
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                await client.post(
+                    f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage',
+                    json={'chat_id': user_id, 'text': 'Не удалось найти и отправить аудиофайл для этого трека. Попробуй другой трек позже.'},
+                )
+        except Exception as notify_error:
+            print(f'[SEND NOTIFY ERROR] {notify_error}')
+
+
+@app.post('/api/send_to_chat')
 async def send_to_chat(track: TrackData, background_tasks: BackgroundTasks, user_id: int = Depends(get_user_id)):
-    if not track.preview: raise HTTPException(status_code=400, detail="No preview")
-    audio_url = track.preview
-    if audio_url.startswith('/'):
-        audio_url = os.getenv("API_BASE_URL", "https://evumus.onrender.com") + audio_url
-
-    # Добавляем задачу в фон и сразу возвращаем ответ
-    background_tasks.add_task(send_audio_task, user_id, track, audio_url)
-    
-    return {"status": "ok"}
+    if not norm(track.title):
+        raise HTTPException(status_code=400, detail='Track title is required')
+    # The background task deliberately resolves a fresh alternative source by
+    # title/artist and uploads binary audio to Telegram; preview URLs are ignored.
+    background_tasks.add_task(send_audio_task, user_id, track)
+    return {'status': 'queued', 'delivery': 'telegram_audio_upload', 'source_policy': 'no_soundcloud'}
 
 # ==========================================
 # УТИЛИТЫ
@@ -784,14 +894,10 @@ async def _serve_hls_manifest(url: str):
     """Fetch an HLS playlist and rewrite every playlist/key/map/segment URL through this API."""
     try:
         timeout = httpx.Timeout(connect=10.0, read=35.0, write=15.0, pool=10.0)
-        response = await get_http().get(
-            url,
-            headers={"Accept-Encoding": "identity", "Accept": "application/vnd.apple.mpegurl,application/x-mpegURL,*/*"},
-            timeout=timeout,
-        )
+        response = await get_http().get(url, headers={"Accept-Encoding": "identity"}, timeout=timeout)
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail="HLS manifest is temporarily unavailable")
+        raise HTTPException(status_code=502, detail=f"HLS manifest fetch failed: {type(exc).__name__}: {exc}")
 
     body = response.text.lstrip("\ufeff\n\r ")
     if not body.startswith("#EXTM3U"):
@@ -1302,12 +1408,14 @@ def _match_text(value: str) -> str:
     return re.sub(r"[^\w\s]", " ", value, flags=re.U)
 
 @app.get("/api/track/resolve")
-async def resolve_full_track(title: str = Query(...), artist: str = Query(""), duration: int = Query(0, ge=0)):
+async def resolve_full_track(title: str = Query(...), artist: str = Query(""), duration: int = Query(0, ge=0), exclude_source: str = Query("")):
     title, artist = norm(title), norm(artist)
     if not title:
         raise HTTPException(status_code=400, detail="Track title is required")
     cache_key = (_match_text(title), _match_text(artist))
     cached = _cache_get(_track_resolve_cache, cache_key)
+    if cached is not None and exclude_source and str(cached.get('source') or '').lower() == exclude_source.lower():
+        cached = None
     if cached is not None:
         # Do not trust an old cached match if its stream has since expired.
         if cached.get('source') == 'soundcloud':
@@ -1344,6 +1452,8 @@ async def resolve_full_track(title: str = Query(...), artist: str = Query(""), d
             continue
         for item in group:
             if item.get("full") is False or item.get("source") in ("itunes", "deezer"):
+                continue
+            if exclude_source and str(item.get('source') or '').lower() == exclude_source.lower():
                 continue
             if not (item.get("audio_url") or item.get("ym_id") or (item.get("source") == "soundcloud" and item.get("ext_id"))):
                 continue
