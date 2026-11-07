@@ -64,53 +64,35 @@
     return parseInt(durStr, 10) || 0;
   }
 
-  // Единый расчёт длительности и прогресса для обычного аудио и HLS.
-  // У HLS audio.duration иногда бывает Infinity/NaN, поэтому используем
-  // длительность трека из каталога как резервное значение.
-  function getPlaybackDuration(audio, track) {
-    var actual = Number(audio && audio.duration);
-    if (Number.isFinite(actual) && actual > 0) return actual;
-
-    var metadata = Number(track && track.duration);
-    if (Number.isFinite(metadata) && metadata > 0) return metadata;
-
-    return parseDuration(track && track.dur) || 0;
+  // Единый прогресс для обычного аудио и HLS.
+  function trackDurationSeconds(track) {
+    if (!track) return 0;
+    var raw = Number(track.duration);
+    // В API duration обычно приходит в секундах, но некоторые источники дают ms.
+    if (Number.isFinite(raw) && raw > 0) return raw > 100000 ? raw / 1000 : raw;
+    return parseDuration(String(track.dur || '')) || 0;
   }
 
-  function updatePlayerProgress(audio, track) {
-    if (previewAudio !== audio || seekDrag) return;
+  function updateAudioProgress(audio, track) {
+    if (!audio || previewAudio !== audio || seekDrag) return;
+    var duration = Number(audio.duration);
+    if (!Number.isFinite(duration) || duration <= 0) duration = trackDurationSeconds(track);
+    if (!Number.isFinite(duration) || duration <= 0) return;
 
-    var duration = getPlaybackDuration(audio, track);
-    if (!(duration > 0)) return;
-
-    var current = Number(audio.currentTime) || 0;
-    var percent = Math.min(100, Math.max(0, current / duration * 100));
+    var current = Number(audio.currentTime);
+    if (!Number.isFinite(current) || current < 0) current = 0;
+    var percent = Math.max(0, Math.min(100, current / duration * 100));
     var progress = $('#playerProgress');
     if (progress) progress.style.width = percent + '%';
   }
 
-  function bindPlayerProgress(audio, track) {
-    ['timeupdate', 'durationchange', 'loadedmetadata', 'loadeddata', 'playing', 'seeked'].forEach(function (eventName) {
+  function bindAudioProgress(audio, track) {
+    ['timeupdate', 'durationchange', 'loadedmetadata', 'loadeddata',
+     'progress', 'playing', 'seeked'].forEach(function (eventName) {
       audio.addEventListener(eventName, function () {
-        updatePlayerProgress(audio, track);
+        updateAudioProgress(audio, track);
       });
     });
-  }
-
-  function handlePlayerTrackEnded(audio) {
-    if (previewAudio !== audio) return;
-    var progress = $('#playerProgress');
-    if (progress) progress.style.width = '0%';
-
-    var idx = queueIds.indexOf(previewTrackId);
-    if (idx >= 0 && idx < queueIds.length - 1) {
-      var nextTrack = trackRegistry[queueIds[idx + 1]] || findTrack(queueIds[idx + 1]);
-      if (nextTrack && nextTrack.preview) {
-        playPreview(nextTrack);
-        return;
-      }
-    }
-    setPlayingUI(false);
   }
 
   // ===== Кастомное окно подтверждения =====
@@ -966,6 +948,8 @@
     audio.src = absoluteUrl;
     try { audio.load(); audio.currentTime = 0; } catch (e) {}
     showPlayer(t);
+    var initialProgress = $('#playerProgress');
+    if (initialProgress) initialProgress.style.width = '0%';
     setPlayingUI(false);
     var activeRow = $$('.track').find(function (row) { return row.getAttribute('data-id') === previewTrackId; });
     if (activeRow) {
@@ -995,8 +979,18 @@
       };
       toast(messages[code] || 'Не удалось загрузить трек');
     };
-    bindPlayerProgress(audio, t);
-    audio.onended = function () { handlePlayerTrackEnded(audio); };
+    bindAudioProgress(audio, t);
+    audio.onended = function () {
+      if (previewAudio !== audio) return;
+      var progress = $('#playerProgress');
+      if (progress) progress.style.width = '0%';
+      var idx = queueIds.indexOf(previewTrackId);
+      if (idx >= 0 && idx < queueIds.length - 1) {
+        var nextTrack = trackRegistry[queueIds[idx + 1]] || findTrack(queueIds[idx + 1]);
+        if (nextTrack && nextTrack.preview) { playPreview(nextTrack); return; }
+      }
+      setPlayingUI(false);
+    };
     audio.onpause = function () {
       if (previewAudio === audio && !audio.ended) setPlayingUI(false);
     };
@@ -1038,14 +1032,14 @@
     audio.setAttribute('playsinline', '');
     audio.setAttribute('webkit-playsinline', '');
     audio.volume = volume / 100;
-    bindPlayerProgress(audio, t);
+    bindAudioProgress(audio, t);
     showPlayer(t);
+    var initialProgress = $('#playerProgress');
+    if (initialProgress) initialProgress.style.width = '0%';
     setPlayingUI(false);
 
     audio.onplaying = function () { if (previewAudio === audio) setPlayingUI(true); };
     audio.onwaiting = function () { if (previewAudio === audio) setPlayingUI(false); };
-    audio.onpause = function () { if (previewAudio === audio && !audio.ended) setPlayingUI(false); };
-    audio.onended = function () { handlePlayerTrackEnded(audio); };
     // HLS.js controls the MediaSource pipeline. Browsers can emit a transient
     // media-element error while hls.js is still loading/recovering the manifest
     // or first segment. Do not show a false error or start a competing retry.
@@ -1311,14 +1305,12 @@
     var p = Math.min(1, Math.max(0, (clientX - r.left) / r.width)); 
     var pr = $('#playerProgress'); if(pr) pr.style.width = (p * 100) + '%'; 
     if (previewAudio) {
-        var tr = trackRegistry[previewTrackId] || findTrack(previewTrackId);
-        var dur = getPlaybackDuration(previewAudio, tr);
-        if (dur > 0) {
-            try {
-                previewAudio.currentTime = p * dur;
-            } catch (e) {
-                console.warn('[EvuMusic] Seek failed:', e);
-            }
+        var tr = findTrack(previewTrackId);
+        var dur = Number(previewAudio.duration);
+        if (!Number.isFinite(dur) || dur <= 0) dur = trackDurationSeconds(tr);
+        if (Number.isFinite(dur) && dur > 0) {
+          try { previewAudio.currentTime = p * dur; }
+          catch (e) { console.warn('[EvuMusic] seek is not available for this stream:', e); }
         }
     }
   }
