@@ -64,6 +64,55 @@
     return parseInt(durStr, 10) || 0;
   }
 
+  // Единый расчёт длительности и прогресса для обычного аудио и HLS.
+  // У HLS audio.duration иногда бывает Infinity/NaN, поэтому используем
+  // длительность трека из каталога как резервное значение.
+  function getPlaybackDuration(audio, track) {
+    var actual = Number(audio && audio.duration);
+    if (Number.isFinite(actual) && actual > 0) return actual;
+
+    var metadata = Number(track && track.duration);
+    if (Number.isFinite(metadata) && metadata > 0) return metadata;
+
+    return parseDuration(track && track.dur) || 0;
+  }
+
+  function updatePlayerProgress(audio, track) {
+    if (previewAudio !== audio || seekDrag) return;
+
+    var duration = getPlaybackDuration(audio, track);
+    if (!(duration > 0)) return;
+
+    var current = Number(audio.currentTime) || 0;
+    var percent = Math.min(100, Math.max(0, current / duration * 100));
+    var progress = $('#playerProgress');
+    if (progress) progress.style.width = percent + '%';
+  }
+
+  function bindPlayerProgress(audio, track) {
+    ['timeupdate', 'durationchange', 'loadedmetadata', 'loadeddata', 'playing', 'seeked'].forEach(function (eventName) {
+      audio.addEventListener(eventName, function () {
+        updatePlayerProgress(audio, track);
+      });
+    });
+  }
+
+  function handlePlayerTrackEnded(audio) {
+    if (previewAudio !== audio) return;
+    var progress = $('#playerProgress');
+    if (progress) progress.style.width = '0%';
+
+    var idx = queueIds.indexOf(previewTrackId);
+    if (idx >= 0 && idx < queueIds.length - 1) {
+      var nextTrack = trackRegistry[queueIds[idx + 1]] || findTrack(queueIds[idx + 1]);
+      if (nextTrack && nextTrack.preview) {
+        playPreview(nextTrack);
+        return;
+      }
+    }
+    setPlayingUI(false);
+  }
+
   // ===== Кастомное окно подтверждения =====
   var confirmCb = null;
   function showConfirm(text, cb) { 
@@ -946,24 +995,8 @@
       };
       toast(messages[code] || 'Не удалось загрузить трек');
     };
-    audio.ontimeupdate = function () {
-      if (previewAudio !== audio || seekDrag) return;
-      var duration = audio.duration;
-      if (!duration || !isFinite(duration) || duration === 0 || duration === 30) duration = parseDuration(t.dur) || 30;
-      var progress = $('#playerProgress');
-      if (progress) progress.style.width = Math.min(100, (audio.currentTime / duration * 100)) + '%';
-    };
-    audio.onended = function () {
-      if (previewAudio !== audio) return;
-      var progress = $('#playerProgress');
-      if (progress) progress.style.width = '0%';
-      var idx = queueIds.indexOf(previewTrackId);
-      if (idx >= 0 && idx < queueIds.length - 1) {
-        var nextTrack = trackRegistry[queueIds[idx + 1]] || findTrack(queueIds[idx + 1]);
-        if (nextTrack && nextTrack.preview) { playPreview(nextTrack); return; }
-      }
-      setPlayingUI(false);
-    };
+    bindPlayerProgress(audio, t);
+    audio.onended = function () { handlePlayerTrackEnded(audio); };
     audio.onpause = function () {
       if (previewAudio === audio && !audio.ended) setPlayingUI(false);
     };
@@ -1005,11 +1038,14 @@
     audio.setAttribute('playsinline', '');
     audio.setAttribute('webkit-playsinline', '');
     audio.volume = volume / 100;
+    bindPlayerProgress(audio, t);
     showPlayer(t);
     setPlayingUI(false);
 
     audio.onplaying = function () { if (previewAudio === audio) setPlayingUI(true); };
     audio.onwaiting = function () { if (previewAudio === audio) setPlayingUI(false); };
+    audio.onpause = function () { if (previewAudio === audio && !audio.ended) setPlayingUI(false); };
+    audio.onended = function () { handlePlayerTrackEnded(audio); };
     // HLS.js controls the MediaSource pipeline. Browsers can emit a transient
     // media-element error while hls.js is still loading/recovering the manifest
     // or first segment. Do not show a false error or start a competing retry.
@@ -1275,12 +1311,15 @@
     var p = Math.min(1, Math.max(0, (clientX - r.left) / r.width)); 
     var pr = $('#playerProgress'); if(pr) pr.style.width = (p * 100) + '%'; 
     if (previewAudio) {
-        var tr = findTrack(previewTrackId);
-        var dur = previewAudio.duration;
-        if (!dur || !isFinite(dur) || dur === 0 || dur === 30) {
-            dur = (tr ? parseDuration(tr.dur) : 0) || 30;
+        var tr = trackRegistry[previewTrackId] || findTrack(previewTrackId);
+        var dur = getPlaybackDuration(previewAudio, tr);
+        if (dur > 0) {
+            try {
+                previewAudio.currentTime = p * dur;
+            } catch (e) {
+                console.warn('[EvuMusic] Seek failed:', e);
+            }
         }
-        previewAudio.currentTime = p * dur; 
     }
   }
   function seekStart(clientX) { if (!previewAudio) return; seekDrag = true; var pr = $('#playerProgress'); if(pr) pr.classList.add('dragging'); seekByPoint(clientX); setPlayingUI(true); }
