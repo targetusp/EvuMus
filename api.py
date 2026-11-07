@@ -784,10 +784,14 @@ async def _serve_hls_manifest(url: str):
     """Fetch an HLS playlist and rewrite every playlist/key/map/segment URL through this API."""
     try:
         timeout = httpx.Timeout(connect=10.0, read=35.0, write=15.0, pool=10.0)
-        response = await get_http().get(url, headers={"Accept-Encoding": "identity"}, timeout=timeout)
+        response = await get_http().get(
+            url,
+            headers={"Accept-Encoding": "identity", "Accept": "application/vnd.apple.mpegurl,application/x-mpegURL,*/*"},
+            timeout=timeout,
+        )
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"HLS manifest fetch failed: {type(exc).__name__}: {exc}")
+        raise HTTPException(status_code=502, detail="HLS manifest is temporarily unavailable")
 
     body = response.text.lstrip("\ufeff\n\r ")
     if not body.startswith("#EXTM3U"):
